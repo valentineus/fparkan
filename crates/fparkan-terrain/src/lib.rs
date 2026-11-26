@@ -49,6 +49,17 @@ pub struct SurfaceHit {
     pub face: usize,
 }
 
+/// The top terrain triangle supporting an object at an XY position.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainSupport {
+    /// Elevation of the supporting triangle at that position.
+    pub height: f32,
+    /// Flags of that triangle.
+    pub mask: FullSurfaceMask,
+    /// Upward unit normal of the triangle.
+    pub normal: [f32; 3],
+}
+
 /// Areal id.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ArealId(pub u32);
@@ -558,6 +569,29 @@ impl TerrainWorld {
         &self,
         position: [f32; 2],
     ) -> Result<Option<(f32, FullSurfaceMask)>, TerrainError> {
+        Ok(self
+            .support_triangle_at(position)?
+            .map(|(height, triangle)| (height, triangle.mask)))
+    }
+
+    /// Returns the top surface with the geometric normal of the same triangle.
+    pub fn support_plane_at(
+        &self,
+        position: [f32; 2],
+    ) -> Result<Option<TerrainSupport>, TerrainError> {
+        Ok(self
+            .support_triangle_at(position)?
+            .map(|(height, triangle)| TerrainSupport {
+                height,
+                mask: triangle.mask,
+                normal: triangle.upward_normal(),
+            }))
+    }
+
+    fn support_triangle_at(
+        &self,
+        position: [f32; 2],
+    ) -> Result<Option<(f32, &RuntimeTriangle)>, TerrainError> {
         if self.surfaces.is_empty() {
             return Err(TerrainError::Unsupported);
         }
@@ -566,8 +600,8 @@ impl TerrainWorld {
             let triangle = &self.surfaces[index];
             if let Some(height) = triangle.height_at(position) {
                 best = Some(match best {
-                    Some((current, mask)) if current >= height => (height.max(current), mask),
-                    _ => (height, triangle.mask),
+                    Some((current, face)) if current >= height => (height.max(current), face),
+                    _ => (height, triangle),
                 });
             }
         }
@@ -870,6 +904,15 @@ fn ray_intersects_surface_bounds(
 }
 
 impl RuntimeTriangle {
+    fn upward_normal(&self) -> [f32; 3] {
+        let a = sub3_f64(self.vertices[1], self.vertices[0]);
+        let b = sub3_f64(self.vertices[2], self.vertices[0]);
+        let normal = cross3_f64(a, b);
+        // Height queries already exclude triangles with a degenerate XY projection.
+        let length = dot3_f64(normal, normal).sqrt().copysign(normal[2]);
+        normal.map(|axis| (axis / length) as f32)
+    }
+
     fn height_at(&self, position: [f32; 2]) -> Option<f32> {
         let a = [self.vertices[0][0], self.vertices[0][1]];
         let b = [self.vertices[1][0], self.vertices[1][1]];

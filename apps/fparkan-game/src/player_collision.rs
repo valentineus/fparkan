@@ -10,10 +10,10 @@ impl StaticVulkanApp {
                 let [start, end] = step.sweep.expect("walking floor probe");
                 let support = |[x, y, _]: [f32; 3]| {
                     self.terrain
-                        .support_at([x, y])
+                        .support_plane_at([x, y])
                         .map_err(|err| err.to_string())
                 };
-                let previous = support(start)?.map(|(height, _)| height);
+                let previous = support(start)?.map(|plane| plane.height);
                 let next = support(end)?;
                 step = step.with_scene_terrain(previous, next);
                 previous.is_none() || next.is_none()

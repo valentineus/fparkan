@@ -106,6 +106,7 @@ mod patrol_points;
 mod player_gait;
 mod player_motion;
 mod unit_speed;
+mod walking_slope;
 pub use patrol_points::PatrolPointReport;
 pub use unit_speed::{UnitSpeedKind, UnitSpeedReport};
 mod factory_release;

@@ -1,8 +1,8 @@
 use super::{transform_state, Engine, EngineError, StartingCockpit, SurfaceQuery, TransformState};
 use crate::manual_flight::{FlightDrive, FlightProfile};
-use crate::TerrainWorld;
+use crate::{walking_slope::WalkingSlope, TerrainWorld};
 use fparkan_resource::CachedResourceRepository;
-use fparkan_terrain::FullSurfaceMask;
+use fparkan_terrain::{FullSurfaceMask, TerrainSupport};
 
 pub(super) fn warbot_can_fly(engine: &crate::Engine, object_index: usize) -> bool {
     let profile = || {
@@ -68,6 +68,7 @@ pub struct PlayerMotionStep {
     max_floor_clearance: f32,
     previous_terrain_height: Option<f32>,
     terrain_height: Option<f32>,
+    terrain_normal: Option<[f32; 3]>,
     surface: WalkingSurface,
     /// Sweep segment when the step translates the hero.
     pub sweep: Option<[[f32; 3]; 2]>,
@@ -96,12 +97,13 @@ impl PlayerMotionStep {
     pub fn with_scene_terrain(
         mut self,
         previous: Option<f32>,
-        next: Option<(f32, FullSurfaceMask)>,
+        next: Option<TerrainSupport>,
     ) -> Self {
         self.previous_terrain_height = previous;
-        self.terrain_height = next.map(|(height, _)| height);
-        self.surface = next.map_or(WalkingSurface::Ground, |(_, mask)| {
-            WalkingSurface::terrain(mask)
+        self.terrain_height = next.map(|plane| plane.height);
+        self.terrain_normal = next.map(|plane| plane.normal);
+        self.surface = next.map_or(WalkingSurface::Ground, |plane| {
+            WalkingSurface::terrain(plane.mask)
         });
         if let Some([from, to]) = self.sweep.as_mut() {
             to[2] = previous
@@ -174,6 +176,15 @@ impl PlayerMotionStep {
         }
     }
 
+    fn slope_speed_factor(self, limit: Option<WalkingSlope>) -> f32 {
+        if let (WalkingSurface::Ground, Some(limit), Some(normal), Some([from, to])) =
+            (self.surface, limit, self.terrain_normal, self.sweep)
+        {
+            return limit.speed_factor(normal, [to[0] - from[0], to[1] - from[1]]);
+        }
+        1.0
+    }
+
     pub(super) fn touches_water(self) -> bool {
         self.surface == WalkingSurface::Water
             && self.terrain_height.is_some_and(|height| {
@@ -214,6 +225,7 @@ mod tests {
             max_floor_clearance: FLOOR_CLEARANCE,
             previous_terrain_height: None,
             terrain_height: Some(11.5),
+            terrain_normal: Some([0.0, -0.8, 0.6]),
             surface: super::WalkingSurface::Ground,
             sweep: Some([[3.0, 6.0, 12.5], [4.0, 6.0, 15.5]]),
         };
@@ -223,6 +235,12 @@ mod tests {
         );
         assert_eq!(step.terrain_exit_floor(), Some(11.5));
         let lowered = step.with_building_floor(11.5, Some(12.0));
+        let mut words = [0; 27];
+        words[21] = 2;
+        words[23] = 0.6_f32.to_bits();
+        let slope = super::WalkingSlope::from_profile(&words);
+        assert_eq!(step.slope_speed_factor(slope), 0.0);
+        assert_eq!(lowered.slope_speed_factor(slope), 1.0);
         assert_eq!(lowered.pose.position.map(f32::from_bits), [4.0, 6.0, 11.52]);
         assert_eq!(lowered.sweep.unwrap()[1], [4.0, 6.0, 12.02]);
         assert_eq!(
@@ -249,6 +267,7 @@ mod tests {
             max_floor_clearance: 1.25,
             previous_terrain_height: Some(10.0),
             terrain_height: Some(10.0),
+            terrain_normal: None,
             surface: super::WalkingSurface::Ground,
             sweep: Some([[3.0, 6.0, 11.75], [4.0, 6.0, 11.75]]),
         };
@@ -271,12 +290,17 @@ mod tests {
             max_floor_clearance: FLOOR_CLEARANCE,
             previous_terrain_height: None,
             terrain_height: None,
+            terrain_normal: None,
             surface: super::WalkingSurface::Ground,
             sweep: Some([[3.0, 6.0, 10.52], [4.0, 6.0, 10.52]]),
         }
         .with_scene_terrain(
             Some(10.0),
-            Some((10.0, super::FullSurfaceMask(super::WATER_SURFACE))),
+            Some(fparkan_terrain::TerrainSupport {
+                height: 10.0,
+                mask: super::FullSurfaceMask(super::WATER_SURFACE),
+                normal: [0.0, 0.0, 1.0],
+            }),
         );
         assert!(step.touches_water());
         assert!(!step.with_building_floor(10.0, None).touches_water());
@@ -388,7 +412,7 @@ fn plan_player_steps(
     engine: &Engine,
     cockpit: StartingCockpit,
     mut input: PlayerMotion,
-    resolve: Option<ResolveMotion<'_>>,
+    mut resolve: Option<ResolveMotion<'_>>,
 ) -> Result<Option<PlayerMotionStep>, EngineError> {
     let (Some(mission), Ok(pose)) = (
         &engine.loaded,
@@ -425,21 +449,26 @@ fn plan_player_steps(
     if !input.delta_seconds.is_finite() || input.delta_seconds < 0.0 {
         return Err(EngineError::Movement("invalid player step".into()));
     }
-    let speeds = if boarded.is_some() && !flying {
-        crate::manual_chassis::speed_limits(mission, cockpit.handle)
-            .unwrap_or([WALK_SPEED_FALLBACK; 2])
-    } else if mission.local_hero == Some(cockpit.handle) {
-        let forward = mission
+    let hero_profile = if mission.local_hero == Some(cockpit.handle) {
+        mission
             .control_device_tables
             .iter()
             .find(|table| table.handle == cockpit.handle)
             .and_then(|table| table.owner_profile.as_ref())
-            .map(|profile| f32::from_bits(profile.current_words[7]))
+            .map(|profile| &profile.current_words)
+    } else {
+        None
+    };
+    let slope = hero_profile.and_then(WalkingSlope::from_profile);
+    let speeds = if boarded.is_some() && !flying {
+        crate::manual_chassis::speed_limits(mission, cockpit.handle)
+            .unwrap_or([WALK_SPEED_FALLBACK; 2])
+    } else {
+        let forward = hero_profile
+            .map(|words| f32::from_bits(words[7]))
             .filter(|speed| speed.is_finite() && *speed >= 0.0)
             .unwrap_or(WALK_SPEED_FALLBACK);
         [WALK_SPEED_FALLBACK, forward]
-    } else {
-        [WALK_SPEED_FALLBACK; 2]
     };
     // shortcut: use the outdoor spawn clearance until the native walking collider is wired.
     let mut max_floor_clearance = FLOOR_CLEARANCE;
@@ -448,13 +477,7 @@ fn plan_player_steps(
             max_floor_clearance = spawn_floor_clearance(&mission.terrain, draft.position)?;
         }
     }
-    let Some(resolve) = resolve else {
-        let mut step = plan_motion(&mission.terrain, pose, pitch, flight, speeds, input)?;
-        step.max_floor_clearance = max_floor_clearance;
-        crate::manual_chassis::support_step(chassis_ground, &mission.terrain, pose, &mut step)?;
-        return Ok(Some(step));
-    };
-    let count = if !flying && input.movement != [0.0; 2] {
+    let count = if resolve.is_some() && !flying && input.movement != [0.0; 2] {
         // shortcut: bound movement after a long stall while the scene uses the render clock.
         input.delta_seconds = input.delta_seconds.min(0.5);
         let [across, along] = body_velocity(input.movement, speeds);
@@ -464,40 +487,49 @@ fn plan_player_steps(
     }
     .max(1);
     input.delta_seconds /= count as f32;
-    let mut step = plan_motion(&mission.terrain, pose, pitch, flight, speeds, input)?;
     let mut previous = pose;
     let mut previous_surface = WalkingSurface::Ground;
-    input.mouse_x = 0.0;
-    input.mouse_y = 0.0;
+    let mut pitch = pitch;
     for index in 0..count {
-        if index != 0 {
-            step = plan_motion(
-                &mission.terrain,
-                previous,
-                f32::from_bits(step.pitch_bits),
-                flight,
-                speeds,
-                input,
-            )?;
+        let mut propose = |input| {
+            let mut step = plan_motion(&mission.terrain, previous, pitch, flight, speeds, input)?;
+            step.max_floor_clearance = max_floor_clearance;
+            match resolve.as_mut() {
+                Some(resolve) => resolve(step),
+                None => Ok((step, false)),
+            }
+        };
+        let (mut step, mut blocked) = propose(input)?;
+        if !blocked {
+            let factor = step.slope_speed_factor(slope);
+            if factor < 1.0 {
+                // The existing hero step applies the speed immediately. Use the
+                // native speed envelope and resample the shortened step's support.
+                (step, blocked) = propose(PlayerMotion {
+                    delta_seconds: input.delta_seconds * factor,
+                    ..input
+                })?;
+                blocked |= factor == 0.0;
+            }
         }
-        step.max_floor_clearance = max_floor_clearance;
-        let (resolved, blocked) = resolve(step)?;
-        step = resolved;
         if blocked {
             step.pose.position = previous.position;
             step.sweep = None;
             step.surface = previous_surface;
             step.flight_velocity = step.flight_velocity.map(|_| [0.0; 3]);
-            break;
+            return Ok(Some(step));
         }
         crate::manual_chassis::support_step(chassis_ground, &mission.terrain, previous, &mut step)?;
-        if drowns(engine, cockpit, step) {
-            break;
+        if index + 1 == count || drowns(engine, cockpit, step) {
+            return Ok(Some(step));
         }
+        input.mouse_x = 0.0;
+        input.mouse_y = 0.0;
+        pitch = f32::from_bits(step.pitch_bits);
         previous = step.pose;
         previous_surface = step.surface;
     }
-    Ok(Some(step))
+    unreachable!("a movement sample always has at least one step")
 }
 
 pub(super) fn commit_flight(
@@ -562,6 +594,7 @@ fn plan_motion(
     let mut flight_velocity = None;
     let mut previous_terrain_height = None;
     let mut terrain_height = None;
+    let mut terrain_normal = None;
     let mut surface = WalkingSurface::Ground;
     if let Some(flight) = flight {
         let [across, along] = input.movement;
@@ -595,18 +628,19 @@ fn plan_motion(
             ));
         }
         if xy != [from[0], from[1]] {
-            if let (Some(old_ground), Some((new_ground, mask))) = (
+            if let (Some(old_ground), Some(plane)) = (
                 terrain
                     .height_at([from[0], from[1]])
                     .map_err(|err| EngineError::Movement(err.to_string()))?,
                 terrain
-                    .support_at(xy)
+                    .support_plane_at(xy)
                     .map_err(|err| EngineError::Movement(err.to_string()))?,
             ) {
-                let to = [xy[0], xy[1], new_ground + (from[2] - old_ground)];
+                let to = [xy[0], xy[1], plane.height + (from[2] - old_ground)];
                 previous_terrain_height = Some(old_ground);
-                terrain_height = Some(new_ground);
-                surface = WalkingSurface::terrain(mask);
+                terrain_height = Some(plane.height);
+                terrain_normal = Some(plane.normal);
+                surface = WalkingSurface::terrain(plane.mask);
                 pose.position = to.map(f32::to_bits);
                 // shortcut: one sweep at body height until the physical collider
                 // and floor transitions are recovered.
@@ -627,6 +661,7 @@ fn plan_motion(
         max_floor_clearance: FLOOR_CLEARANCE,
         previous_terrain_height,
         terrain_height,
+        terrain_normal,
         surface,
         sweep,
     })
