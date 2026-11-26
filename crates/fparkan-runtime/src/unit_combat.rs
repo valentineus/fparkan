@@ -5,6 +5,7 @@ use super::{
     player_weapon::prepare_unit_weapons,
     projectile::{load_projectile, segment_sphere_fraction, unit_sphere},
     projectile_terrain_hit, projectile_unit_hit,
+    turret_aim::{hull_local_point, TurretAim},
     unit_patrol::UnitPatrol,
     weapon_pose::WeaponPoses,
     Engine, MissionAssets, MissionDocument, MissionObjectDraft, ObjectHandle, PlayerProjectile,
@@ -244,6 +245,14 @@ impl AutoDemoCombat {
         &self.pose_failures
     }
 
+    pub(super) fn turret_aim(&self, handle: ObjectHandle, component: usize) -> Option<TurretAim> {
+        self.units
+            .iter()
+            .find(|unit| unit.handle == handle)?
+            .poses
+            .aim(component)
+    }
+
     pub(super) fn flights(&self) -> impl Iterator<Item = (usize, PlayerProjectile)> + '_ {
         self.flights
             .iter()
@@ -413,54 +422,61 @@ impl AutoDemoCombat {
             if unit.weapons.weapons().is_empty() {
                 continue;
             }
-            unit.poses.sample(
-                &mission.mission_assets,
-                unit.index,
-                unit.original_id,
-                now,
-                &mut self.pose_failures,
-            );
             // shortcut: armed AI units defend their position while their Init is incomplete.
             let owner = identity_metadata(&engine.world, unit.handle)
                 .ok()
                 .and_then(|identity| identity.owner_id);
             let guard = owner
                 .is_some_and(|owner| self.guard_clans.get(usize::from(owner.0)) == Some(&true));
-            if mission.script_host_mode == super::MissionMode::SingleMission
-                && !guard
-                && !mission
+            let eligible = mission.script_host_mode != super::MissionMode::SingleMission
+                || guard
+                || mission
                     .unit_patrol
                     .as_ref()
-                    .is_some_and(|patrol| patrol.is_patrolling(unit.handle))
-            {
+                    .is_some_and(|patrol| patrol.is_patrolling(unit.handle));
+            let aim = eligible
+                .then(|| {
+                    targets
+                        .iter()
+                        .find(|(handle, target)| *handle == unit.handle && target.in_range)
+                        .map(|(_, target)| (target.handle, target.center, target.radius))
+                        .or_else(|| {
+                            let (factory, index) =
+                                mission.unit_patrol.as_ref()?.raid_factory(unit.handle)?;
+                            let target_owner =
+                                identity_metadata(&engine.world, factory).ok()?.owner_id?;
+                            if self
+                                .hostile
+                                .get(usize::from(owner?.0))?
+                                .get(usize::from(target_owner.0))
+                                != Some(&true)
+                            {
+                                return None;
+                            }
+                            let state = transform_state(&engine.world, unit.handle).ok()?;
+                            let (from, _) =
+                                unit_sphere(&mission.mission_assets, unit.index, state)?;
+                            let target = transform_state(&engine.world, factory).ok()?;
+                            let (to, _) = unit_sphere(&mission.mission_assets, index, target)?;
+                            if (to[0] - from[0]).hypot(to[1] - from[1]) > FIRE_RANGE {
+                                return None;
+                            }
+                            // shortcut: the native attack task's selected building node is unresolved.
+                            Some((factory, to, 0.0))
+                        })
+                })
+                .flatten();
+            unit.poses.sample(
+                &mission.mission_assets,
+                unit.index,
+                unit.original_id,
+                now,
+                aim.and_then(|(_, target, _)| hull_local_point(state, target)),
+                &mut self.pose_failures,
+            );
+            if !eligible {
                 continue;
             }
-            let aim = targets
-                .iter()
-                .find(|(handle, target)| *handle == unit.handle && target.in_range)
-                .map(|(_, target)| (target.handle, target.center, target.radius))
-                .or_else(|| {
-                    let (factory, index) =
-                        mission.unit_patrol.as_ref()?.raid_factory(unit.handle)?;
-                    let target_owner = identity_metadata(&engine.world, factory).ok()?.owner_id?;
-                    if self
-                        .hostile
-                        .get(usize::from(owner?.0))?
-                        .get(usize::from(target_owner.0))
-                        != Some(&true)
-                    {
-                        return None;
-                    }
-                    let state = transform_state(&engine.world, unit.handle).ok()?;
-                    let (from, _) = unit_sphere(&mission.mission_assets, unit.index, state)?;
-                    let target = transform_state(&engine.world, factory).ok()?;
-                    let (to, _) = unit_sphere(&mission.mission_assets, index, target)?;
-                    if (to[0] - from[0]).hypot(to[1] - from[1]) > FIRE_RANGE {
-                        return None;
-                    }
-                    // shortcut: the native attack task's selected building node is unresolved.
-                    Some((factory, to, 0.0))
-                });
             let mut missing = 0;
             let mut due_missing = 0;
             let poses = &unit.poses;
@@ -599,6 +615,7 @@ mod tests {
         )
         .unwrap();
         let mut observed_shots = 0;
+        let mut observed_aimed_turret = false;
         let mut observed_unavailable = engine.autodemo_combat.as_ref().unwrap().unavailable as u64;
         for now in (0..=120_000).step_by(50) {
             let frame = frame(&mut engine, now).unwrap();
@@ -636,6 +653,7 @@ mod tests {
                     .find(|unit| unit.handle == flight.shooter)
                     .unwrap();
                 let state = transform_state(&engine.world, shooter.handle).unwrap();
+                observed_aimed_turret |= shooter.poses.has_aim();
                 let (center, _) = unit_sphere(
                     &engine.loaded.as_ref().unwrap().mission_assets,
                     shooter.index,
@@ -670,6 +688,7 @@ mod tests {
                 assert_eq!(total.first_ms, now);
                 assert_eq!(total.count, 1);
                 assert!(observed_shots > 0);
+                assert!(observed_aimed_turret, "no stock turret tracked its target");
                 return;
             }
         }

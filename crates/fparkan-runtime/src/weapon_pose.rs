@@ -1,6 +1,9 @@
 //! CPU poses for mounted weapon CPT points, independent of the renderer.
 
-use crate::{MissionAssets, MissionObjectDraft};
+use crate::{
+    turret_aim::{apply_autonomous_turret_pose, has_turret_aim, TurretAim},
+    MissionAssets, MissionObjectDraft,
+};
 use fparkan_animation::{AnimationTime, NodePoseBuffer, Pose};
 use fparkan_assets::{
     sample_control_node_times, ControlInstanceState, PreparedControlGateProvider,
@@ -33,6 +36,7 @@ pub(super) struct WeaponPoses {
     mounts: Vec<Mount>,
     states: Vec<ControlInstanceState>,
     hierarchies: Vec<Option<NodePoseBuffer>>,
+    aims: Vec<Option<TurretAim>>,
 }
 
 impl WeaponPoses {
@@ -64,6 +68,7 @@ impl WeaponPoses {
             mounts,
             states: vec![ControlInstanceState::default(); visuals.len()],
             hierarchies: vec![None; visuals.len()],
+            aims: vec![None; visuals.len()],
         }
     }
 
@@ -73,6 +78,7 @@ impl WeaponPoses {
         index: usize,
         object: u32,
         now: u32,
+        hull_local_target: Option<[f32; 3]>,
         report: &mut WeaponPoseReport,
     ) {
         for (component, &visual) in assets.visuals_for_object(index).iter().enumerate() {
@@ -86,17 +92,21 @@ impl WeaponPoses {
                 .get(index)
                 .and_then(|controls| controls.get(component))
                 .and_then(Option::as_ref);
+            let aim = control
+                .filter(|control| has_turret_aim(control))
+                .and_then(|_| self.aim_at(component, hull_local_target?));
+            self.aims[component] = aim;
             let times = control.and_then(|control| {
-                // Match the renderer's current gate inputs. Native AI aim and
-                // recoil providers are still outside this pose contract.
+                // Match the renderer's query gates. Recoil still uses the
+                // initial Control providers.
                 let gates = control.typed_records.iter().filter(|record| record.tag == 21)
                     .map(|record| match record.gate_provider {
                         PreparedControlGateProvider::Resolved { initial_type1_value, .. }
                             if initial_type1_value.is_finite() => Some(initial_type1_value),
                         _ => None,
                     }).collect::<Vec<_>>();
-                match sample_control_node_times(control, now, &gates, &mut self.states[component]) {
-                    Ok(times) => Some(times.into_iter().map(|time| time.map(AnimationTime)).collect()),
+                let mut times = match sample_control_node_times(control, now, &gates, &mut self.states[component]) {
+                    Ok(times) => times,
                     Err(error) => {
                         let (count, reason) = report.fallbacks.entry((object, component)).or_default();
                         if *count == 0 {
@@ -104,9 +114,14 @@ impl WeaponPoses {
                             *reason = format!("{error:?}");
                         }
                         *count += 1;
-                        initial_component_node_times(model.validated.node_count, &control.bindings).ok()
+                        initial_component_node_times(model.validated.node_count, &control.bindings).ok()?
+                            .into_iter().map(|time| time.map(|time| time.0)).collect()
                     }
+                };
+                if let Some(aim) = aim {
+                    apply_autonomous_turret_pose(control, aim, &mut times);
                 }
+                Some(times.into_iter().map(|time| time.map(AnimationTime)).collect())
             });
             let times = times.or_else(|| {
                 control
@@ -118,6 +133,41 @@ impl WeaponPoses {
                 .and_then(|times| node38_sampled_hierarchy_at_times(&model.validated, times))
                 .or_else(|| node38_fallback_hierarchy(&model.validated));
         }
+    }
+
+    fn aim_at(&self, component: usize, target: [f32; 3]) -> Option<TurretAim> {
+        let local = match *self.mounts.get(component)? {
+            Mount::Root => target,
+            Mount::Unavailable => return None,
+            Mount::Socket(parent, socket) => {
+                let to_hull =
+                    |point| mounted_point(&self.hierarchies, &self.mounts, parent, socket, point);
+                let origin = to_hull([0.0; 3])?;
+                let project = |axis| {
+                    let end = to_hull(axis)?;
+                    Some(
+                        (0..3)
+                            .map(|i| (end[i] - origin[i]) * (target[i] - origin[i]))
+                            .sum(),
+                    )
+                };
+                [
+                    project([1.0, 0.0, 0.0])?,
+                    project([0.0, 1.0, 0.0])?,
+                    project([0.0, 0.0, 1.0])?,
+                ]
+            }
+        };
+        TurretAim::toward(local)
+    }
+
+    pub(super) fn aim(&self, component: usize) -> Option<TurretAim> {
+        self.aims.get(component).copied().flatten()
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_aim(&self) -> bool {
+        self.aims.iter().any(Option::is_some)
     }
 
     pub(super) fn muzzle(
@@ -259,6 +309,7 @@ mod tests {
         let poses = WeaponPoses {
             mounts: vec![Mount::Root],
             states: vec![],
+            aims: vec![],
             hierarchies: vec![Some(NodePoseBuffer {
                 poses: vec![Pose::default()],
             })],

@@ -7302,7 +7302,7 @@ fn update_gameplay_animation_pose_buffers(
     native_clock_ms: u32,
     aim: Option<(StartingCockpit, f32)>,
     player_doors: Option<([f32; 3], f32, &[BuildingCollisionBinding])>,
-    motion: Option<(&[Option<MissionRenderRoot>], &WorldSnapshot)>,
+    motion: Option<(&[Option<MissionRenderRoot>], &WorldSnapshot, &Engine)>,
 ) -> Result<(), String> {
     for (object_index, components) in instances.iter_mut().enumerate() {
         let Some(object_pose_buffers) = pose_buffers.get_mut(object_index) else {
@@ -7383,11 +7383,26 @@ fn update_gameplay_animation_pose_buffers(
                     }
                 }
             }
-            let walking = motion.is_some_and(|(roots, snapshot)| {
+            let walking = motion.is_some_and(|(roots, snapshot, engine)| {
                 roots
                     .get(object_index)
                     .and_then(Option::as_ref)
                     .is_some_and(|root| {
+                        if aim.is_none_or(|(cockpit, _)| cockpit.object_index != object_index)
+                            && fparkan_runtime::has_turret_aim(&instance.control)
+                        {
+                            if let Some(aim) = fparkan_runtime::autonomous_turret_aim(
+                                engine,
+                                root.handle,
+                                component_index,
+                            ) {
+                                fparkan_runtime::apply_autonomous_turret_pose(
+                                    &instance.control,
+                                    aim,
+                                    &mut node_times,
+                                );
+                            }
+                        }
                         chassis_animation::sample(instance, root, snapshot, &mut node_times)
                     })
             });
@@ -7416,6 +7431,7 @@ fn control_tree_chain_animates(
     tree: Option<&[fparkan_prototype::UnitComponentTreeNode]>,
     controls: &[Option<PreparedComponentControl>],
     turret_component: Option<usize>,
+    autonomous: bool,
 ) -> bool {
     let mut current = Some(component_index);
     let mut remaining = controls.len();
@@ -7426,6 +7442,7 @@ fn control_tree_chain_animates(
                 .and_then(Option::as_ref)
                 .is_some_and(|control| {
                     fparkan_runtime::has_proximity_doors(control)
+                        || (autonomous && fparkan_runtime::has_turret_aim(control))
                         || control.typed_records.iter().any(|record| record.tag == 21)
                 })
         {
@@ -8416,6 +8433,10 @@ fn static_preview_mesh_and_materials(
                         cockpit
                             .filter(|cockpit| cockpit.object_index == object_index)
                             .map(|cockpit| cockpit.component_index),
+                        live_roots
+                            && mission_root
+                                .unit_dat_header_flags
+                                .is_some_and(|class| class & 0x0100_0000 != 0),
                     ));
             // Native AniMesh only resolves global MSH node sockets for EXTO
             // geometry. Internal INTO components use controller/equipment
@@ -11405,7 +11426,14 @@ impl StaticVulkanApp {
             player_doors,
             self.mission_frame
                 .as_ref()
-                .map(|frame| (self.mission_render_roots.as_slice(), &frame.snapshot)),
+                .zip(self.mission_engine.as_ref())
+                .map(|(frame, engine)| {
+                    (
+                        self.mission_render_roots.as_slice(),
+                        &frame.snapshot,
+                        engine,
+                    )
+                }),
         )?;
         let placements = self
             .mission_frame
@@ -14862,7 +14890,13 @@ mod tests {
         };
         let control = socket_timeline_control();
         let controls = vec![None, Some(control.clone()), None];
-        assert!(control_tree_chain_animates(2, Some(&tree), &controls, None));
+        assert!(control_tree_chain_animates(
+            2,
+            Some(&tree),
+            &controls,
+            None,
+            false
+        ));
         let mut instances = vec![vec![
             None,
             Some(ControlAnimationInstance {
