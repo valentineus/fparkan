@@ -1,5 +1,4 @@
 use super::StaticVulkanApp;
-use fparkan_terrain::SurfaceQuery;
 
 impl StaticVulkanApp {
     pub(super) fn resolve_player_building_step(
@@ -9,13 +8,13 @@ impl StaticVulkanApp {
         if let Some(probe) = step.floor_probe() {
             let crossing_cut = if self.terrain.basement_foundation().is_some() {
                 let [start, end] = step.sweep.expect("walking floor probe");
-                let height = |[x, y, _]: [f32; 3]| {
+                let support = |[x, y, _]: [f32; 3]| {
                     self.terrain
-                        .height_at([x, y])
+                        .support_at([x, y])
                         .map_err(|err| err.to_string())
                 };
-                let previous = height(start)?;
-                let next = height(end)?;
+                let previous = support(start)?.map(|(height, _)| height);
+                let next = support(end)?;
                 step = step.with_scene_terrain(previous, next);
                 previous.is_none() || next.is_none()
             } else {
@@ -35,20 +34,24 @@ impl StaticVulkanApp {
             } else {
                 None
             };
-            let mut floor = mesh_floor;
+            let mut floor = mesh_floor.map(|height| (height, false));
             if let Some(height) = terrain_exit {
-                if floor.is_none_or(|mesh| mesh < height)
+                if mesh_floor.is_none_or(|mesh| mesh < height)
                     && (crossing_cut || previous_mesh.is_some())
                     && !self.building_segment_blocked([
                         [probe[0][0], probe[0][1], height + 0.02],
                         probe[0],
                     ])?
                 {
-                    floor = Some(height);
+                    floor = Some((height, true));
                 }
             }
-            if let Some(height) = floor {
-                step = step.with_building_floor(height, previous_mesh);
+            if let Some((height, terrain)) = floor {
+                step = if terrain {
+                    step.with_terrain_floor(height, previous_mesh)
+                } else {
+                    step.with_building_floor(height, previous_mesh)
+                };
                 if let Some(segments) = step.floor_sweeps() {
                     for segment in segments.into_iter().filter(|[from, to]| from != to) {
                         if self.building_segment_blocked(segment)? {

@@ -3009,6 +3009,10 @@ pub fn frame_with_player_motion(
         pose.position = previous.position;
     }
     set_transform(&mut engine.world, cockpit.handle, pose)?;
+    let drowned = !blocked && player_motion::drowns(engine, cockpit, motion);
+    if drowned {
+        fparkan_world::request_delete(&mut engine.world, cockpit.handle)?;
+    }
     let passenger = boarding::move_passenger(engine, cockpit, pose);
     match frame(engine, queue_time_ms) {
         Ok(mut frame) => {
@@ -3019,7 +3023,9 @@ pub fn frame_with_player_motion(
             Ok(frame)
         }
         Err(error) => {
-            set_transform(&mut engine.world, cockpit.handle, previous)?;
+            if !drowned {
+                set_transform(&mut engine.world, cockpit.handle, previous)?;
+            }
             if let Some((handle, previous)) = passenger {
                 set_transform(&mut engine.world, handle, previous)?;
             }

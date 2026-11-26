@@ -1,6 +1,7 @@
 use super::{transform_state, Engine, EngineError, StartingCockpit, SurfaceQuery, TransformState};
 use crate::TerrainWorld;
 use fparkan_resource::CachedResourceRepository;
+use fparkan_terrain::FullSurfaceMask;
 
 pub(super) fn warbot_can_fly(engine: &crate::Engine, object_index: usize) -> bool {
     let profile = || {
@@ -14,10 +15,18 @@ pub(super) fn warbot_can_fly(engine: &crate::Engine, object_index: usize) -> boo
     })
 }
 
+pub(super) fn drowns(engine: &Engine, cockpit: StartingCockpit, step: PlayerMotionStep) -> bool {
+    step.touches_water()
+        && engine.loaded.as_ref().is_some_and(|mission| {
+            mission.boarding.is_none() && mission.local_hero == Some(cockpit.handle)
+        })
+}
+
 // shortcut: bound stair steps and drops until the native hero collider is wired.
 const STEP_UP: f32 = 0.85;
 const STEP_DOWN: f32 = 2.0;
 const FLOOR_CLEARANCE: f32 = 0.02;
+const WATER_SURFACE: u32 = 0x0002_0000;
 // shortcut: sample the temporary floor probe at most 0.16 units apart until native collision is wired.
 const WALK_COLLISION_INTERVAL: f32 = 0.02;
 
@@ -45,6 +54,7 @@ pub struct PlayerMotionStep {
     max_floor_clearance: f32,
     previous_terrain_height: Option<f32>,
     terrain_height: Option<f32>,
+    wet_floor: bool,
     /// Sweep segment when the step translates the hero.
     pub sweep: Option<[[f32; 3]; 2]>,
 }
@@ -52,12 +62,17 @@ pub struct PlayerMotionStep {
 impl PlayerMotionStep {
     /// Uses the scene's terrain after foundation cuts and fills.
     #[must_use]
-    pub fn with_scene_terrain(mut self, previous: Option<f32>, next: Option<f32>) -> Self {
+    pub fn with_scene_terrain(
+        mut self,
+        previous: Option<f32>,
+        next: Option<(f32, FullSurfaceMask)>,
+    ) -> Self {
         self.previous_terrain_height = previous;
-        self.terrain_height = next;
+        self.terrain_height = next.map(|(height, _)| height);
+        self.wet_floor = next.is_some_and(|(_, mask)| mask.0 & WATER_SURFACE != 0);
         if let Some([from, to]) = self.sweep.as_mut() {
             to[2] = previous
-                .zip(next)
+                .zip(self.terrain_height)
                 .map_or(from[2], |(previous, next)| next + (from[2] - previous));
             self.pose.position[2] = (to[2] - 0.5).to_bits();
         }
@@ -113,7 +128,24 @@ impl PlayerMotionStep {
         });
         self.pose.position[2] = (height + clearance).to_bits();
         sweep[1][2] = height + clearance + 0.5;
+        self.wet_floor = false;
         self
+    }
+
+    /// Lands on a terrain surface beyond the end of a building floor.
+    #[must_use]
+    pub fn with_terrain_floor(self, height: f32, previous_mesh: Option<f32>) -> Self {
+        Self {
+            wet_floor: self.wet_floor,
+            ..self.with_building_floor(height, previous_mesh)
+        }
+    }
+
+    pub(super) fn touches_water(self) -> bool {
+        self.wet_floor
+            && self.terrain_height.is_some_and(|height| {
+                f32::from_bits(self.pose.position[2]) <= height + self.max_floor_clearance + 0.05
+            })
     }
 
     /// Sweeps vertically before crossing a step up, and horizontally before a step down.
@@ -145,6 +177,7 @@ mod tests {
             max_floor_clearance: FLOOR_CLEARANCE,
             previous_terrain_height: None,
             terrain_height: Some(11.5),
+            wet_floor: false,
             sweep: Some([[3.0, 6.0, 12.5], [4.0, 6.0, 15.5]]),
         };
         assert_eq!(
@@ -179,6 +212,7 @@ mod tests {
             max_floor_clearance: 1.25,
             previous_terrain_height: Some(10.0),
             terrain_height: Some(10.0),
+            wet_floor: false,
             sweep: Some([[3.0, 6.0, 11.75], [4.0, 6.0, 11.75]]),
         };
         assert_eq!(
@@ -189,6 +223,98 @@ mod tests {
             f32::from_bits(step.with_building_floor(10.0, Some(10.25)).pose.position[2]),
             11.0
         );
+    }
+
+    #[test]
+    fn a_building_floor_over_water_carries_the_hero() {
+        let step = PlayerMotionStep {
+            pose: TransformState::default(),
+            pitch_bits: 0,
+            flying: false,
+            max_floor_clearance: FLOOR_CLEARANCE,
+            previous_terrain_height: None,
+            terrain_height: None,
+            wet_floor: false,
+            sweep: Some([[3.0, 6.0, 10.52], [4.0, 6.0, 10.52]]),
+        }
+        .with_scene_terrain(
+            Some(10.0),
+            Some((10.0, super::FullSurfaceMask(super::WATER_SURFACE))),
+        );
+        assert!(step.touches_water());
+        assert!(!step.with_building_floor(10.0, None).touches_water());
+        assert!(step.with_terrain_floor(10.0, None).touches_water());
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_constructor_walk_into_water_fails_immediately() {
+        use crate::{
+            create, frame, frame_with_player_motion, load_gameplay_mission,
+            loaded_mission_script_outcome, plan_player_motion_with_collision, starting_cockpit,
+            EngineServices, MissionMode, MissionRequest, MissionScriptOutcome, MissionStartupInput,
+            PlayerMotion,
+        };
+        use fparkan_vfs::DirectoryVfs;
+        use std::sync::Arc;
+
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.02/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let cockpit = starting_cockpit(&engine).unwrap();
+        frame(&mut engine, 0).unwrap();
+        for now in (250..=130_000).step_by(250) {
+            let state = super::transform_state(&engine.world, cockpit.handle).unwrap();
+            let [x, y, _] = state.position.map(f32::from_bits);
+            let [dx, dy] = [1158.739 - x, 816.309 - y];
+            let distance = dx.hypot(dy);
+            assert!(distance > 0.25, "the walk reached the middle of the lake");
+            let (sin, cos) = f32::from_bits(state.orientation[2]).sin_cos();
+            let step = plan_player_motion_with_collision(
+                &engine,
+                cockpit,
+                PlayerMotion {
+                    movement: [
+                        (dx * cos + dy * sin) / distance,
+                        (dy * cos - dx * sin) / distance,
+                    ],
+                    delta_seconds: 0.25,
+                    ..Default::default()
+                },
+                |step| Ok((step, false)),
+            )
+            .unwrap()
+            .unwrap();
+            let wet = step.touches_water();
+            let result = frame_with_player_motion(&mut engine, now, cockpit, step, false).unwrap();
+            let alive = result
+                .snapshot
+                .transforms
+                .iter()
+                .any(|(handle, _)| *handle == cockpit.handle);
+            if wet {
+                assert!(!alive, "the hero survived water contact");
+                assert_eq!(
+                    loaded_mission_script_outcome(&engine),
+                    Some(MissionScriptOutcome::Failed)
+                );
+                return;
+            }
+            assert!(alive, "the hero died before reaching water");
+        }
+        panic!("the hero did not enter the lake");
     }
 }
 
@@ -244,21 +370,9 @@ fn plan_player_steps(
         return Ok(None);
     }
     let pitch = f32::from_bits(mission.player_pitch_bits);
-    let Some(resolve) = resolve else {
-        return plan_motion(&mission.terrain, pose, pitch, flying, input).map(Some);
-    };
     if !input.delta_seconds.is_finite() || input.delta_seconds < 0.0 {
         return Err(EngineError::Movement("invalid player step".into()));
     }
-    let count = if !flying && input.movement != [0.0; 2] {
-        // shortcut: bound movement after a long stall while the scene uses the render clock.
-        input.delta_seconds = input.delta_seconds.min(0.5);
-        (input.delta_seconds / WALK_COLLISION_INTERVAL).ceil() as u32
-    } else {
-        1
-    }
-    .max(1);
-    input.delta_seconds /= count as f32;
     // shortcut: use the outdoor spawn clearance until the native walking collider is wired.
     let mut max_floor_clearance = FLOOR_CLEARANCE;
     if !flying && input.movement != [0.0; 2] {
@@ -273,6 +387,20 @@ fn plan_player_steps(
             }
         }
     }
+    let Some(resolve) = resolve else {
+        let mut step = plan_motion(&mission.terrain, pose, pitch, flying, input)?;
+        step.max_floor_clearance = max_floor_clearance;
+        return Ok(Some(step));
+    };
+    let count = if !flying && input.movement != [0.0; 2] {
+        // shortcut: bound movement after a long stall while the scene uses the render clock.
+        input.delta_seconds = input.delta_seconds.min(0.5);
+        (input.delta_seconds / WALK_COLLISION_INTERVAL).ceil() as u32
+    } else {
+        1
+    }
+    .max(1);
+    input.delta_seconds /= count as f32;
     let mut step = plan_motion(&mission.terrain, pose, pitch, flying, input)?;
     let mut previous = pose;
     input.mouse_x = 0.0;
@@ -293,6 +421,10 @@ fn plan_player_steps(
         if blocked {
             step.pose.position = previous.position;
             step.sweep = None;
+            step.wet_floor = false;
+            break;
+        }
+        if drowns(engine, cockpit, step) {
             break;
         }
         previous = step.pose;
@@ -359,6 +491,7 @@ fn plan_motion(
     let mut sweep = None;
     let mut previous_terrain_height = None;
     let mut terrain_height = None;
+    let mut wet_floor = false;
     if flying && (xy != [from[0], from[1]] || climb != 0.0) {
         let old_xy = [from[0], from[1]];
         let floor = |xy| {
@@ -386,17 +519,18 @@ fn plan_motion(
             }
         }
     } else if xy != [from[0], from[1]] {
-        if let (Some(old_ground), Some(new_ground)) = (
+        if let (Some(old_ground), Some((new_ground, mask))) = (
             terrain
                 .height_at([from[0], from[1]])
                 .map_err(|err| EngineError::Movement(err.to_string()))?,
             terrain
-                .height_at(xy)
+                .support_at(xy)
                 .map_err(|err| EngineError::Movement(err.to_string()))?,
         ) {
             let to = [xy[0], xy[1], new_ground + (from[2] - old_ground)];
             previous_terrain_height = Some(old_ground);
             terrain_height = Some(new_ground);
+            wet_floor = mask.0 & WATER_SURFACE != 0;
             pose.position = to.map(f32::to_bits);
             // shortcut: one sweep at body height until the physical collider
             // and floor transitions are recovered.
@@ -416,6 +550,7 @@ fn plan_motion(
         max_floor_clearance: FLOOR_CLEARANCE,
         previous_terrain_height,
         terrain_height,
+        wet_floor,
         sweep,
     })
 }

@@ -552,8 +552,12 @@ impl TerrainWorld {
     }
 }
 
-impl SurfaceQuery for TerrainWorld {
-    fn height_at(&self, position: [f32; 2]) -> Result<Option<f32>, TerrainError> {
+impl TerrainWorld {
+    /// Returns the highest terrain surface and its authored flags at this XY.
+    pub fn support_at(
+        &self,
+        position: [f32; 2],
+    ) -> Result<Option<(f32, FullSurfaceMask)>, TerrainError> {
         if self.surfaces.is_empty() {
             return Err(TerrainError::Unsupported);
         }
@@ -561,10 +565,19 @@ impl SurfaceQuery for TerrainWorld {
         for index in self.surface_bvh.xy_candidates(position) {
             let triangle = &self.surfaces[index];
             if let Some(height) = triangle.height_at(position) {
-                best = Some(best.map_or(height, |current: f32| current.max(height)));
+                best = Some(match best {
+                    Some((current, mask)) if current >= height => (height.max(current), mask),
+                    _ => (height, triangle.mask),
+                });
             }
         }
         Ok(best)
+    }
+}
+
+impl SurfaceQuery for TerrainWorld {
+    fn height_at(&self, position: [f32; 2]) -> Result<Option<f32>, TerrainError> {
+        Ok(self.support_at(position)?.map(|(height, _)| height))
     }
 
     fn raycast(
