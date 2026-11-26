@@ -21,6 +21,7 @@ pub struct PlayerWeapon {
     pub(super) control_record_index: usize,
     pub(super) charge: Option<crate::mobile_budget::Charge>,
     pub(super) energy_waits: u64,
+    pub(super) autonomous_fire_distance: f32,
     /// Name of the projectile prototype.
     pub projectile: String,
     /// Archive named by the weapon's projectile descriptor.
@@ -126,13 +127,13 @@ impl PlayerWeapons {
         trigger: bool,
         clock_ms: u32,
     ) -> impl Iterator<Item = (usize, &PlayerWeapon, &PreparedControlPoint)> {
-        self.fire_where(clock_ms, move |_, _| trigger)
+        self.fire_where(clock_ms, move |_, _, _| trigger)
     }
 
     pub(super) fn fire_where(
         &mut self,
         clock_ms: u32,
-        mut trigger: impl FnMut(&PlayerWeapon, &PreparedControlPoint) -> bool,
+        mut trigger: impl FnMut(usize, &PlayerWeapon, &PreparedControlPoint) -> bool,
     ) -> impl Iterator<Item = (usize, &PlayerWeapon, &PreparedControlPoint)> {
         if let Some(last) = self.last_sample_ms.replace(clock_ms) {
             self.clock_ms += f64::from(clock_ms.wrapping_sub(last));
@@ -144,7 +145,7 @@ impl PlayerWeapons {
             .enumerate()
             .filter_map(move |(index, weapon)| {
                 let start = selected.is_none_or(|selected| selected == index)
-                    && trigger(weapon, &weapon.barrels[weapon.barrel_index].muzzle);
+                    && trigger(index, weapon, &weapon.barrels[weapon.barrel_index].muzzle);
                 let barrel = weapon.sample_fire(start, now)?;
                 Some((index, &*weapon, &weapon.barrels[barrel].muzzle))
             })
@@ -354,6 +355,7 @@ fn prepare_weapons(
                 control_record_index,
                 charge: None,
                 energy_waits: 0,
+                autonomous_fire_distance: f32::from_bits(record.fixed_words[19]),
                 projectile,
                 projectile_archive,
                 effect,
@@ -436,6 +438,7 @@ mod tests {
                 control_record_index: 0,
                 charge: None,
                 energy_waits: 0,
+                autonomous_fire_distance: 0.0,
                 projectile: String::from("test"),
                 projectile_archive: String::from("test.rlb"),
                 effect: None,

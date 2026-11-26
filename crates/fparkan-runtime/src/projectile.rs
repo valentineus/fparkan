@@ -25,6 +25,7 @@ pub struct ProjectileAssets {
     pub lifetime_ms: u32,
     /// Initial provider volume of the projectile.
     pub volume: Option<f32>,
+    pub(super) autonomous_fire_distance: f32,
 }
 
 /// Prepares the BULL prototype referenced by a manual weapon.
@@ -74,6 +75,7 @@ pub(super) fn load_projectile(
     };
     let speed = f32::from_bits(control.native_profile_words[7]);
     let lifetime_ms = control.native_profile_words[18];
+    let autonomous_fire_distance = f32::from_bits(control.native_profile_words[22]);
     let volume = control.node_data.as_ref().and_then(|data| {
         let amount = data.rows.first()?.max_volume;
         (amount.is_finite() && amount > 0.0).then_some(amount)
@@ -86,6 +88,7 @@ pub(super) fn load_projectile(
         speed,
         lifetime_ms,
         volume,
+        autonomous_fire_distance,
     })
 }
 

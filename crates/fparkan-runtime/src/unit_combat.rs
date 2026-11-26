@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 // Behavior's default Patrol_Attack_Range and Attack_MaxFireDistance.
 const ATTACK_RANGE: f32 = 400.0;
-const FIRE_RANGE: f32 = 200.0;
+const ATTACK_STOP_RANGE: f32 = 200.0;
 
 /// An autonomous projectile type, in render-pool order.
 pub struct AutoDemoProjectileType {
@@ -30,6 +30,7 @@ pub struct AutoDemoProjectileType {
     speed: f32,
     lifetime_ms: u32,
     volume: Option<f32>,
+    autonomous_fire_distance: f32,
 }
 
 /// The prepared scene instance associated with a weapon's firing effect.
@@ -208,6 +209,7 @@ impl AutoDemoCombat {
                                 speed: data.speed,
                                 lifetime_ms: data.lifetime_ms,
                                 volume: data.volume,
+                                autonomous_fire_distance: data.autonomous_fire_distance,
                             });
                             Some(battle.projectiles.len() - 1)
                         })?;
@@ -324,6 +326,17 @@ impl AutoDemoCombat {
         patrol: Option<&UnitPatrol>,
         controls: &[super::MissionControlDeviceTableState],
     ) -> Vec<(ObjectHandle, CombatTarget)> {
+        self.select_targets(world, assets, patrol, controls, false)
+    }
+
+    fn select_targets(
+        &self,
+        world: &fparkan_world::World,
+        assets: &MissionAssets,
+        patrol: Option<&UnitPatrol>,
+        controls: &[super::MissionControlDeviceTableState],
+        use_weapon_range: bool,
+    ) -> Vec<(ObjectHandle, CombatTarget)> {
         let live: Vec<_> = self
             .units
             .iter()
@@ -332,7 +345,7 @@ impl AutoDemoCombat {
                 let state = transform_state(world, unit.handle).ok()?;
                 let (center, radius) = unit_sphere(assets, unit.index, state)?;
                 Some((
-                    unit.handle,
+                    unit,
                     usize::from(owner.0),
                     center,
                     radius,
@@ -341,7 +354,8 @@ impl AutoDemoCombat {
             })
             .collect();
         live.iter()
-            .filter_map(|&(handle, clan, from, _, position)| {
+            .filter_map(|&(unit, clan, from, _, position)| {
+                let handle = unit.handle;
                 if patrol.is_some_and(|patrol| {
                     patrol.is_shut_down(handle)
                         || patrol.is_moving_to_destination(handle)
@@ -365,20 +379,32 @@ impl AutoDemoCombat {
                             handle: target,
                             center,
                             radius,
-                            in_range: distance <= FIRE_RANGE,
+                            in_range: distance <= ATTACK_STOP_RANGE,
                         },
                     ));
                 }
-                let limit = patrol.and_then(|patrol| patrol.attack_limit(world, handle));
+                // The patrol area bounds pursuit. A Control weapon can fire
+                // across that boundary while the hull follows its order.
+                let limit = if use_weapon_range {
+                    None
+                } else {
+                    patrol.and_then(|patrol| patrol.attack_limit(world, handle))
+                };
                 if limit.is_some_and(|limit| !limit.allows_attack(position)) {
                     return None;
                 }
+                let search_distance = if use_weapon_range {
+                    self.maximum_firing_distance(unit)
+                } else {
+                    ATTACK_RANGE
+                };
                 let (enemy, center, radius, distance) = live
                     .iter()
                     .filter_map(|&(enemy, other, to, radius, target_position)| {
+                        let enemy = enemy.handle;
                         let distance = (to[0] - from[0]).hypot(to[1] - from[1]);
                         (enemy != handle
-                            && distance <= ATTACK_RANGE
+                            && distance <= search_distance
                             && limit
                                 .is_none_or(|limit| limit.allows_target(enemy, target_position))
                             && self.hostile.get(clan)?.get(other) == Some(&true))
@@ -391,11 +417,25 @@ impl AutoDemoCombat {
                         handle: enemy,
                         center,
                         radius,
-                        in_range: distance <= FIRE_RANGE,
+                        in_range: distance <= ATTACK_STOP_RANGE,
                     },
                 ))
             })
             .collect()
+    }
+
+    fn maximum_firing_distance(&self, unit: &Unit) -> f32 {
+        unit.weapons
+            .weapons()
+            .iter()
+            .zip(&unit.slots)
+            .filter_map(|(weapon, slot)| {
+                Some(firing_distance(
+                    weapon.autonomous_fire_distance,
+                    self.projectiles[(*slot)?].autonomous_fire_distance,
+                ))
+            })
+            .fold(0.0, f32::max)
     }
 
     pub(super) fn tick(
@@ -480,11 +520,12 @@ impl AutoDemoCombat {
         let Some(mission) = &engine.loaded else {
             return (events, unavailable);
         };
-        let targets = self.targets(
+        let targets = self.select_targets(
             &engine.world,
             &mission.mission_assets,
             mission.unit_patrol.as_ref(),
             &mission.control_device_tables,
+            true,
         );
         for unit in &mut self.units {
             unit.weapons.read_control_energy(engine, unit.handle);
@@ -522,7 +563,7 @@ impl AutoDemoCombat {
                 .then(|| {
                     targets
                         .iter()
-                        .find(|(handle, target)| *handle == unit.handle && target.in_range)
+                        .find(|(handle, _)| *handle == unit.handle)
                         .map(|(_, target)| (target.handle, target.center, target.radius))
                         .or_else(|| {
                             let (factory, index) =
@@ -537,14 +578,8 @@ impl AutoDemoCombat {
                             {
                                 return None;
                             }
-                            let state = transform_state(&engine.world, unit.handle).ok()?;
-                            let (from, _) =
-                                unit_sphere(&mission.mission_assets, unit.index, state)?;
                             let target = transform_state(&engine.world, factory).ok()?;
                             let (to, _) = unit_sphere(&mission.mission_assets, index, target)?;
-                            if (to[0] - from[0]).hypot(to[1] - from[1]) > FIRE_RANGE {
-                                return None;
-                            }
                             // shortcut: the native attack task's selected building node is unresolved.
                             Some((factory, to, 0.0))
                         })
@@ -573,10 +608,21 @@ impl AutoDemoCombat {
                         .is_some_and(|contact| ground.is_none_or(|ground| contact < ground))
                 })
             };
-            for (slot, weapon, barrel) in unit.weapons.fire_where(now, |weapon, barrel| {
+            let hull_position = state.position.map(f32::from_bits);
+            for (slot, weapon, barrel) in unit.weapons.fire_where(now, |slot, weapon, barrel| {
                 let Some((_, to, radius)) = aim else {
                     return false;
                 };
+                let Some(projectile) = unit.slots[slot] else {
+                    return false;
+                };
+                let distance = firing_distance(
+                    weapon.autonomous_fire_distance,
+                    self.projectiles[projectile].autonomous_fire_distance,
+                );
+                if !within_firing_distance(hull_position, to, distance) {
+                    return false;
+                }
                 let Some(from) = poses.muzzle(state, weapon.component_index, barrel) else {
                     missing += 1;
                     return false;
@@ -659,6 +705,24 @@ impl AutoDemoCombat {
     }
 }
 
+fn firing_distance(weapon: f32, projectile: f32) -> f32 {
+    // Control+0x297e0 overrides the weapon's selector 8 with a positive
+    // value from the projectile's owner profile.
+    if projectile > 0.0 {
+        projectile
+    } else {
+        weapon.max(0.0)
+    }
+}
+
+fn within_firing_distance(from: [f32; 3], to: [f32; 3], range: f32) -> bool {
+    if range <= 0.0 || !range.is_finite() {
+        return false;
+    }
+    let distance_sq: f32 = (0..3).map(|axis| (to[axis] - from[axis]).powi(2)).sum();
+    distance_sq <= range * range
+}
+
 fn clip_segment([start, end]: [[f32; 3]; 2], fraction: f32) -> [[f32; 3]; 2] {
     if fraction == 1.0 {
         [start, end]
@@ -673,6 +737,19 @@ fn clip_segment([start, end]: [[f32; 3]; 2], fraction: f32) -> [[f32; 3]; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autonomous_weapon_checks_projectile_range_in_three_dimensions() {
+        assert_eq!(firing_distance(100.0, 350.0), 350.0);
+        assert_eq!(firing_distance(100.0, 0.0), 100.0);
+        assert_eq!(firing_distance(-1.0, 0.0), 0.0);
+        assert!(within_firing_distance([0.0; 3], [300.0, 400.0, 0.0], 500.0));
+        assert!(!within_firing_distance(
+            [0.0; 3],
+            [300.0, 400.0, 15.0],
+            500.0
+        ));
+    }
 
     #[test]
     fn visible_segment_ends_at_world_contact() {
@@ -820,6 +897,7 @@ mod tests {
         let mut observed_aimed_turret = false;
         let mut observed_finished_segment = false;
         let mut observed_weapon_effect = false;
+        let mut observed_opening_shot = false;
         crate::collect_unit_destruction_effects(&mut engine);
         let mut observed_unavailable = engine.autodemo_combat.as_ref().unwrap().unavailable as u64;
         for now in (0..=120_000).step_by(50) {
@@ -868,6 +946,8 @@ mod tests {
             {
                 let AutoDemoCombatEvent::Shot {
                     shooter,
+                    target,
+                    projectile,
                     effect,
                     effect_instance,
                     muzzle_bits,
@@ -878,6 +958,10 @@ mod tests {
                 };
                 assert_eq!(flight.shooter, shooter);
                 assert_eq!(flight.pose.position.map(f32::to_bits), muzzle_bits);
+                observed_opening_shot |= now <= 2_000
+                    && CombatObject::read(&engine.world, shooter).original_id == Some(3)
+                    && CombatObject::read(&engine.world, target).original_id == Some(0)
+                    && combat.projectiles[projectile].name == "bl_m_01";
                 if let Some(effect) = effect {
                     assert!(effect < combat.weapon_effects().len());
                     let instance = effect_instance.expect("shot names its prepared effect row");
@@ -948,6 +1032,10 @@ mod tests {
                 assert_eq!(total.first_ms, now);
                 assert_eq!(total.count, 1);
                 assert!(observed_shots > 0);
+                assert!(
+                    observed_opening_shot,
+                    "the stock laser can reach the opposite flank"
+                );
                 assert!(observed_aimed_turret, "no stock turret tracked its target");
                 assert!(
                     observed_finished_segment,
