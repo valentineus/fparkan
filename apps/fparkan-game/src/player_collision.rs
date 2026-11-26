@@ -71,6 +71,33 @@ impl StaticVulkanApp {
 }
 
 #[cfg(test)]
+pub(crate) fn walk_toward(
+    pose: fparkan_world::TransformState,
+    target: [f32; 2],
+    max_step: f32,
+) -> fparkan_runtime::PlayerMotion {
+    let [x, y, _] = pose.position.map(f32::from_bits);
+    let [dx, dy] = [target[0] - x, target[1] - y];
+    let yaw = f32::from_bits(pose.orientation[2]);
+    let wanted = (-dx).atan2(dy);
+    let turn = (yaw - wanted + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI;
+    // Use normal mouse and forward input. An about-face may use a second sample
+    // because the game clamps mouse deltas.
+    let can_walk = turn.abs() <= 3.0;
+    fparkan_runtime::PlayerMotion {
+        mouse_x: turn / 0.003,
+        movement: [0.0, f32::from(can_walk)],
+        delta_seconds: if can_walk {
+            dx.hypot(dy).min(max_step) / 14.0
+        } else {
+            0.0
+        },
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::tests::clock_test_app;
     use crate::*;
@@ -169,6 +196,8 @@ mod tests {
         };
         let mut now = 0;
         let mut hero = pose(step_mission_frame(&mut engine, now).unwrap());
+        let [spawn_x, spawn_y, spawn_z] = hero.position.map(f32::from_bits);
+        let spawn_clearance = spawn_z - app.terrain.height_at([spawn_x, spawn_y]).unwrap().unwrap();
         let mut door_blends = Vec::new();
         let mut footstep_surfaces = [false; 2];
         for (index, [x, y]) in route
@@ -184,9 +213,6 @@ mod tests {
                 if distance <= 0.04 {
                     break;
                 }
-                let [dx, dy] = [(x - hx) / distance, (y - hy) / distance];
-                let yaw = f32::from_bits(hero.orientation[2]);
-                let (sin, cos) = yaw.sin_cos();
                 let mut node_times: Vec<_> = fparkan_runtime::initial_component_node_times(
                     model.node_count,
                     &control.bindings,
@@ -222,11 +248,7 @@ mod tests {
                 let motion = plan_player_motion_with_collision(
                     &engine,
                     cockpit,
-                    PlayerMotion {
-                        movement: [dx * cos + dy * sin, (dy * cos - dx * sin) * (8.0 / 14.0)],
-                        delta_seconds: distance.min(0.8) / 8.0,
-                        ..Default::default()
-                    },
+                    super::walk_toward(hero, [x, y], 0.8),
                     |step| {
                         app.resolve_player_building_step(step)
                             .map_err(EngineError::Movement)
@@ -274,8 +296,9 @@ mod tests {
         assert_eq!(footstep_surfaces, [true, true]);
         let ground = app.terrain.height_at([x, y]).unwrap().unwrap();
         assert!(
-            (ground..ground + 1.0).contains(&z),
-            "factory exit at {z}, ground {ground}"
+            (z - ground - spawn_clearance).abs() < 0.02,
+            "factory exit clearance {}, stock outdoor clearance {spawn_clearance}",
+            z - ground
         );
     }
 
@@ -374,18 +397,10 @@ mod tests {
                     break;
                 }
                 assert!(index < 899, "blocked for waypoint {dy}: {hx}, {hy}, {hz}");
-                let yaw = f32::from_bits(hero.orientation[2]);
-                let (sin, cos) = yaw.sin_cos();
-                let dx = (x - hx) / distance;
-                let dy = (y - hy) / distance;
                 let step = plan_player_motion_with_collision(
                     &engine,
                     cockpit,
-                    PlayerMotion {
-                        movement: [dx * cos + dy * sin, (dy * cos - dx * sin) * (8.0 / 14.0)],
-                        delta_seconds: distance.min(0.8) / 8.0,
-                        ..Default::default()
-                    },
+                    super::walk_toward(hero, [x, y], 0.8),
                     |step| {
                         app.resolve_player_building_step(step)
                             .map_err(EngineError::Movement)
@@ -397,12 +412,10 @@ mod tests {
                 hero =
                     pose(frame_with_player_motion(&mut engine, now, cockpit, step, false).unwrap());
                 let new_z = f32::from_bits(hero.position[2]);
-                if dy >= -34.0 {
-                    assert!(
-                        (new_z - hz).abs() < 0.3,
-                        "height jump at {hx} {hy}: {hz} -> {new_z}"
-                    );
-                }
+                assert!(
+                    (new_z - hz).abs() < 0.3,
+                    "height jump at {hx} {hy}: {hz} -> {new_z}"
+                );
             }
         }
     }

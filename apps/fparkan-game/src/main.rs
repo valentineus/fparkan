@@ -14055,11 +14055,7 @@ mod tests {
                 let step = plan_player_motion_with_collision(
                     &engine,
                     cockpit,
-                    PlayerMotion {
-                        movement: [(x - hx) / distance, (y - hy) / distance * (8.0 / 14.0)],
-                        delta_seconds: distance.min(8.0 * 0.292) / 8.0,
-                        ..PlayerMotion::default()
-                    },
+                    player_collision::walk_toward(hero, [x, y], 2.0),
                     |step| {
                         app.resolve_player_building_step(step)
                             .map_err(EngineError::Movement)

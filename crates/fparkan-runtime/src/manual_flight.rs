@@ -88,7 +88,7 @@ impl FlightDrive {
     }
 }
 
-fn ramp_axis(velocity: f32, target: f32, acceleration: f32, seconds: f32) -> (f32, f32) {
+pub(super) fn ramp_axis(velocity: f32, target: f32, acceleration: f32, seconds: f32) -> (f32, f32) {
     if acceleration == 0.0 || velocity == target {
         return (velocity, velocity * seconds);
     }

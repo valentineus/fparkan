@@ -97,6 +97,7 @@ use behavior_clock::next_crt_rand;
 mod mesh_collision;
 mod mining;
 pub use laboratory::LaboratoryReport;
+mod hero_walk;
 mod main_teleport;
 mod manual_chassis;
 mod manual_flight;
@@ -106,7 +107,6 @@ mod patrol_points;
 mod player_gait;
 mod player_motion;
 mod unit_speed;
-mod walking_slope;
 pub use patrol_points::PatrolPointReport;
 pub use unit_speed::{UnitSpeedKind, UnitSpeedReport};
 mod factory_release;
@@ -1475,6 +1475,7 @@ struct LoadedMissionState {
     unit_patrol: Option<unit_patrol::UnitPatrol>,
     player_pitch_bits: u32,
     player_gait: player_gait::PlayerGait,
+    hero_walk_velocity: [f32; 2],
     boarding: Option<boarding::Boarding>,
     local_hero: Option<ObjectHandle>,
     script_host_mode: MissionMode,
@@ -2807,6 +2808,7 @@ node_provider_distribution_suspended: false,
         unit_patrol,
         player_pitch_bits: 0,
         player_gait: Default::default(),
+        hero_walk_velocity: [0.0; 2],
         boarding: None,
         local_hero,
         script_host_mode: request.mode,
@@ -3034,7 +3036,12 @@ pub fn frame_with_player_motion(
             if let Some(mission) = &mut engine.loaded {
                 mission.player_pitch_bits = motion.pitch_bits;
                 frame.player_pitch_bits = motion.pitch_bits;
-                player_motion::commit_flight(mission, cockpit, motion, blocked);
+                player_motion::commit_velocity(
+                    mission,
+                    cockpit,
+                    motion,
+                    blocked || drowned || landing.is_some(),
+                );
                 if !blocked
                     && !drowned
                     && landing.is_none()
@@ -18020,19 +18027,20 @@ mod tests {
             pose(&frame_with_player_motion(&mut engine, 200, cockpit, proposed, false).unwrap());
         let [x0, y0, z0] = original.position.map(f32::from_bits);
         let [x1, y1, z1] = walked.position.map(f32::from_bits);
-        let runtime_speed = f32::from_bits(
-            loaded_mission_control_device_tables(&engine)
-                .unwrap()
-                .iter()
-                .find(|table| table.handle == cockpit.handle)
-                .unwrap()
-                .owner_profile
-                .as_ref()
-                .unwrap()
-                .current_words[7],
-        );
+        let profile = &loaded_mission_control_device_tables(&engine)
+            .unwrap()
+            .iter()
+            .find(|table| table.handle == cockpit.handle)
+            .unwrap()
+            .owner_profile
+            .as_ref()
+            .unwrap()
+            .current_words;
+        let runtime_speed = f32::from_bits(profile[7]);
+        let acceleration = f32::from_bits(profile[1]);
         assert!((runtime_speed - 14.0).abs() < 0.01);
-        assert!(((x1 - x0).hypot(y1 - y0) - runtime_speed * 0.1).abs() < 1e-4);
+        let coast_distance = 0.5 * runtime_speed * runtime_speed / acceleration;
+        assert!(((x1 - x0).hypot(y1 - y0) - (runtime_speed * 0.1 - coast_distance)).abs() < 1e-4);
         let ground = |xy| {
             loaded_terrain(&engine)
                 .unwrap()
@@ -18068,8 +18076,21 @@ mod tests {
         }
         let [split_x, split_y, _] = split.position.map(f32::from_bits);
         assert!((split_x - x2).hypot(split_y - y2) < 1e-4);
-        let idle = frame(&mut engine, 700).unwrap();
+        let release = PlayerMotion {
+            delta_seconds: 0.2,
+            ..PlayerMotion::default()
+        };
+        let release_step = plan_player_motion(&engine, cockpit, release)
+            .unwrap()
+            .unwrap();
+        let idle =
+            frame_with_player_motion(&mut engine, 800, cockpit, release_step, false).unwrap();
         assert_eq!(idle.player_pitch_bits, blocked.player_pitch_bits);
+        let [x3, y3, _] = pose(&idle).position.map(f32::from_bits);
+        assert!(((x3 - split_x).hypot(y3 - split_y) - coast_distance).abs() < 1e-4);
+        assert!(plan_player_motion(&engine, cockpit, release)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
