@@ -160,6 +160,7 @@ pub use projectile::{
     apply_projectile_contact, apply_projectile_hit, load_player_projectile, projectile_terrain_hit,
     projectile_unit_hit, PlayerProjectile, ProjectileAssets, ProjectileContact, ProjectileNode,
 };
+pub use projectile_parts::depleted_chassis_nodes;
 pub use research::order_lab_research;
 pub use unit_combat::{AutoDemoCombatEvent, AutoDemoProjectileType, FiringEffectInstance};
 pub use unit_spawn::SpawnedUnit;

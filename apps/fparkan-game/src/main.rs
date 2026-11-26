@@ -8,6 +8,7 @@ mod camera_capture;
 mod chassis_animation;
 #[cfg(windows)]
 mod control_effects;
+mod damage_visibility;
 mod debris;
 mod destruction_effects;
 mod motion_effects;
@@ -11958,6 +11959,15 @@ impl StaticVulkanApp {
                     .set_draw_range_index_count(range, 0)
                     .map_err(|error| format!("hide inactive destruction sprite: {error}"))?;
             }
+        }
+        if let Some(engine) = &self.mission_engine {
+            damage_visibility::apply(
+                engine,
+                &self.dynamic_component_geometry,
+                &self.component_pose_buffers,
+                &self.mesh,
+                renderer,
+            )?;
         }
         if !self.removed_mission_roots.is_empty() || self.boarded_hero_index.is_some() {
             for (index, range) in self.mesh.draw_ranges.iter().enumerate() {

@@ -460,6 +460,7 @@ mod tests {
         );
         assert_eq!(amount(&engine, node), 0.0_f32.to_bits());
         assert_eq!(amount(&engine, 0), root_before);
+        assert!(crate::depleted_chassis_nodes(&engine).any(|item| item == (14, node as usize)));
         assert!(transform_state(&engine.world, target).is_ok());
         let effects = take_unit_destruction_effects(&mut engine);
         assert_eq!(effects.len(), 1);

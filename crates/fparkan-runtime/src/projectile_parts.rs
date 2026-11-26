@@ -2,7 +2,7 @@
 
 use crate::{
     projectile::{segment_sphere_fraction, ProjectileNode},
-    LoadedMissionState, MissionAssets, MissionControlNodeProviderTableStatus, ObjectHandle,
+    Engine, LoadedMissionState, MissionAssets, MissionControlNodeProviderTableStatus, ObjectHandle,
     TransformState,
 };
 use fparkan_assets::PreparedModel;
@@ -11,6 +11,37 @@ use fparkan_msh::{
     SegmentQueryMasks,
 };
 use fparkan_render::LegacyIron3dEulerTransform;
+
+/// Visible chassis nodes exhausted in live warbots, in mission-object and local MSH order.
+pub fn depleted_chassis_nodes(engine: &Engine) -> impl Iterator<Item = (usize, usize)> + '_ {
+    engine.loaded.iter().flat_map(|mission| {
+        mission
+            .control_device_tables
+            .iter()
+            .filter_map(|table| {
+                let index = usize::try_from(table.original_id?.0).ok()?;
+                if mission.object_drafts.get(index)?.unit_dat_header_flags
+                    != Some(super::boarding::WARBOT_CLASS)
+                    || fparkan_world::transform_state(&engine.world, table.handle).is_err()
+                {
+                    return None;
+                }
+                let MissionControlNodeProviderTableStatus::Available(rows) =
+                    &table.node_provider_status
+                else {
+                    return None;
+                };
+                Some((index, rows))
+            })
+            .flat_map(|(index, rows)| {
+                rows.iter()
+                    .skip(1)
+                    .take_while(|row| row.unit_component_index == 0)
+                    .filter(|row| row.current_flags.is_some_and(|flags| flags & 0x12 == 0x10))
+                    .map(move |row| (index, row.source_row_index))
+            })
+    })
+}
 
 pub(super) fn chassis_part_contact(
     mission: &LoadedMissionState,
