@@ -13403,6 +13403,7 @@ mod tests {
             triangle_descriptors: None,
             node_names: None,
             hero_exit_points: Vec::new(),
+            hallway: Default::default(),
             animation: Some(ModelAnimation {
                 keys: vec![
                     AnimKey24 {
@@ -13475,6 +13476,7 @@ mod tests {
             triangle_descriptors: None,
             node_names: None,
             hero_exit_points: Vec::new(),
+            hallway: Default::default(),
             animation: Some(ModelAnimation {
                 keys: vec![AnimKey24 {
                     time: AnimationTime(0.0),
@@ -13530,6 +13532,7 @@ mod tests {
             }]),
             node_names: None,
             hero_exit_points: Vec::new(),
+            hallway: Default::default(),
             animation: Some(ModelAnimation {
                 keys: vec![
                     AnimKey24 {
@@ -13679,6 +13682,7 @@ mod tests {
             ),
             node_names: None,
             hero_exit_points: Vec::new(),
+            hallway: Default::default(),
             animation: Some(ModelAnimation {
                 keys: vec![AnimKey24 {
                     time: AnimationTime(0.0),

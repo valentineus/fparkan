@@ -8,6 +8,9 @@ use fparkan_animation::{
 };
 use fparkan_nres::{EntryMeta, NresDocument, NresError};
 
+mod hallway;
+pub use hallway::{Hallway, HallwayPoint};
+
 /// Node table stream.
 pub const STREAM_NODE_TABLE: u32 = 1;
 /// Slot stream.
@@ -119,6 +122,8 @@ pub struct ModelAsset {
     pub node_names: Option<Vec<Option<String>>>,
     /// Node-local points whose flags mark a hero exit.
     pub hero_exit_points: Vec<(NodeId, [f32; 3])>,
+    /// Points and links used by the building's indoor routes.
+    pub hallway: Hallway,
     /// Optional decoded node-animation streams.
     pub animation: Option<ModelAnimation>,
 }
@@ -1139,10 +1144,11 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
     let node_names = read_optional_stream(document, STREAM_NAMES)?
         .map(|raw| parse_res10_names(&raw.bytes, node_count))
         .transpose()?;
-    let hero_exit_points = read_optional_stream(document, STREAM_GAMEPLAY_POINTS)?
-        .map(|raw| parse_hero_exit_points(&raw, node_count))
+    let hallway = read_optional_stream(document, STREAM_GAMEPLAY_POINTS)?
+        .map(|raw| hallway::parse(&raw))
         .transpose()?
         .unwrap_or_default();
+    let hero_exit_points = hallway.hero_exits(node_count)?;
     let animation = parse_optional_animation(document)?;
 
     Ok(ModelAsset {
@@ -1162,44 +1168,9 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
         triangle_descriptors,
         node_names,
         hero_exit_points,
+        hallway,
         animation,
     })
-}
-
-fn parse_hero_exit_points(
-    stream: &RawStream,
-    node_count: usize,
-) -> Result<Vec<(NodeId, [f32; 3])>, MshError> {
-    const POINT_BYTES: usize = 20;
-    let point_count = stream.attributes.attr1 as usize;
-    let pairs = stream.attributes.attr2 as usize;
-    if !stream.bytes.len().is_multiple_of(POINT_BYTES)
-        || (point_count as u64 + 2 * pairs as u64) != (stream.bytes.len() / POINT_BYTES) as u64
-    {
-        return Err(MshError::InvalidGeometry(
-            "invalid Res17 point table length".into(),
-        ));
-    }
-    let mut exits = Vec::new();
-    for point in stream.bytes.chunks_exact(POINT_BYTES).take(point_count) {
-        let flags = read_u32(point, 12)?;
-        if flags & 0x1000_4000 != 0x4000 {
-            continue;
-        }
-        let node = NodeId(read_u32(point, 16)?);
-        let position = [
-            read_f32(point, 0)?,
-            read_f32(point, 4)?,
-            read_f32(point, 8)?,
-        ];
-        if node.0 as usize >= node_count || !position.iter().all(|axis| axis.is_finite()) {
-            return Err(MshError::InvalidGeometry(
-                "invalid Res17 hero exit point".into(),
-            ));
-        }
-        exits.push((node, position));
-    }
-    Ok(exits)
 }
 
 fn parse_optional_animation(document: &NresDocument) -> Result<Option<ModelAnimation>, MshError> {
@@ -2346,6 +2317,7 @@ mod tests {
             triangle_descriptors: None,
             node_names: None,
             hero_exit_points: Vec::new(),
+            hallway: Default::default(),
             animation: Some(ModelAnimation {
                 keys: vec![
                     AnimKey24 {
@@ -2410,6 +2382,7 @@ mod tests {
             triangle_descriptors: None,
             node_names: None,
             hero_exit_points: Vec::new(),
+            hallway: Default::default(),
             animation: Some(ModelAnimation {
                 keys: vec![
                     AnimKey24 {
@@ -2477,6 +2450,7 @@ mod tests {
             triangle_descriptors: None,
             node_names: None,
             hero_exit_points: Vec::new(),
+            hallway: Default::default(),
             animation: Some(ModelAnimation {
                 keys: vec![
                     AnimKey24 {
@@ -3371,6 +3345,7 @@ mod tests {
             batches,
             node_names: None,
             hero_exit_points: Vec::new(),
+            hallway: Default::default(),
             animation: None,
             triangle_descriptors: Some(
                 tri_flags

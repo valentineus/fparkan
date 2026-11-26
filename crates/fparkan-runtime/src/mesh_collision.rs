@@ -452,6 +452,7 @@ mod tests {
             triangle_descriptors: Some(triangle_descriptors),
             node_names: None,
             hero_exit_points: Vec::new(),
+            hallway: Default::default(),
             animation: None,
         }
     }

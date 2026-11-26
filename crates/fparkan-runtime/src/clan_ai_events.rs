@@ -806,7 +806,7 @@ impl LoadedMissionState {
                                 let problem = problem.as_ref()
                                     .ok_or("Handler(15) capture requires a current problem")?;
                                 let approach = crate::clan_targeting::send_capturer(
-                                    &mut self.unit_patrol, world, &self.object_drafts, &self.mission_assets, unit, target_id,
+                                    &mut self.unit_patrol, world, &self.object_drafts, &self.mission_assets, &self.terrain, unit, target_id,
                                 );
                                 if let Some(approach) = approach {
                                     self.clan_ai_events.capture_orders.push((OwnerId(clan as u16), problem.key, approach));

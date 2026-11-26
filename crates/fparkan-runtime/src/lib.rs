@@ -48,6 +48,7 @@ use behavior_profile::prepare_behavior_profile_states;
 mod boarding;
 mod builder_supply;
 mod building_door;
+mod building_passage;
 mod clan_ai_events;
 mod clan_area_strength;
 mod clan_build_limits;
@@ -9413,6 +9414,7 @@ mod tests {
             triangle_descriptors: None,
             node_names: None,
             hero_exit_points: Vec::new(),
+            hallway: Default::default(),
             animation: None,
         }
     }

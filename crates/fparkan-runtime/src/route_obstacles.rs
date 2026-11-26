@@ -154,6 +154,32 @@ impl Footprint {
         (0..2).all(|axis| p[axis] >= self.min[axis] && p[axis] <= self.max[axis])
     }
 
+    pub(super) fn exterior_along(self, point: [f32; 2], direction: [f32; 2]) -> Option<[f32; 2]> {
+        if !self.contains(point) {
+            return Some(point);
+        }
+        let length = direction[0].hypot(direction[1]);
+        if length == 0.0 || !length.is_finite() {
+            return None;
+        }
+        let direction = direction.map(|component| component / length);
+        let distance = (0..2)
+            .filter(|&axis| direction[axis] != 0.0)
+            .map(|axis| {
+                let edge = if direction[axis] < 0.0 {
+                    self.min[axis]
+                } else {
+                    self.max[axis]
+                };
+                (edge - point[axis]) / direction[axis]
+            })
+            .fold(f32::INFINITY, f32::min)
+            + CORNER_GAP;
+        Some(std::array::from_fn(|axis| {
+            point[axis] + direction[axis] * distance
+        }))
+    }
+
     pub(super) fn intersects(self, from: [f32; 2], to: [f32; 2]) -> bool {
         let (mut first, mut last) = (0.0_f32, 1.0_f32);
         for axis in 0..2 {
