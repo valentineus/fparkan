@@ -29,7 +29,9 @@ pub(super) fn prepare(
     };
     let mut layers = Vec::new();
     for row in rows.iter().filter(|row| {
-        Some(row.table_index) == control.initial_effect_group && row.raw_condition == [0; 3]
+        row.opcode == 4
+            && Some(row.table_index) == control.initial_effect_group
+            && row.raw_condition == [0; 3]
     }) {
         let archive = fixed_effect_field(&row.resource.archive);
         let fx = fixed_effect_field(&row.resource.name);

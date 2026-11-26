@@ -1196,17 +1196,18 @@ pub enum PreparedControlEffectSection {
     Parsed(Vec<PreparedControlEffectRow>),
 }
 
-/// One native type-4 effect row, with point indices kept relative to the
-/// component-local CPT list selected by its control message.
+/// One native effect row. Type 4 uses CPT offsets. Type 3 attaches to a node.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedControlEffectRow {
     /// Index of the enclosing fixed-size row table.
     pub table_index: usize,
     /// Index within the enclosing fixed-size row table.
     pub row_index: usize,
+    /// Native row opcode. Supported placements are type 3 and type 4.
+    pub opcode: u32,
     /// The first three raw condition words consumed by the native checker.
     pub raw_condition: [u32; 3],
-    /// Component-local offsets into the selected point list.
+    /// Component-local CPT offsets for type 4. Type 3 uses the first word as a node offset.
     pub point_offsets: [u32; 3],
     /// The raw native effect selector, including `u32::MAX` auto-selector.
     pub selector: u32,
@@ -3666,7 +3667,7 @@ fn prepare_component_control_from_resource<R: ResourceRepository>(
     resolve_control_gate_providers(&mut control, node_data_source.as_ref());
     let has_effect_rows = matches!(
         &control.effect_section,
-        PreparedControlEffectSection::Parsed(rows) if !rows.is_empty()
+        PreparedControlEffectSection::Parsed(rows) if rows.iter().any(|row| row.opcode == 4)
     );
     let Some(point_source) = point_source.filter(|_| has_effect_rows) else {
         return Ok(Some(control));
@@ -4110,7 +4111,7 @@ where
                     .expect("valid initial group has an opcode list")
                     .push(opcode);
             }
-            if opcode != 4 {
+            if !matches!(opcode, 3 | 4) {
                 continue;
             }
             let raw_condition = [
@@ -4126,6 +4127,7 @@ where
             effect_rows.push(PreparedControlEffectRow {
                 table_index,
                 row_index,
+                opcode,
                 raw_condition,
                 point_offsets,
                 selector: control_u32_at(row, 0x1C).expect("fixed effect row has selector"),
@@ -6738,6 +6740,7 @@ mod tests {
             PreparedControlEffectSection::Parsed(vec![PreparedControlEffectRow {
                 table_index: 0,
                 row_index: 0,
+                opcode: 4,
                 raw_condition: [4, 5, 6],
                 point_offsets: [12, 13, 14],
                 selector: 15,
@@ -6805,7 +6808,7 @@ mod tests {
     }
 
     #[test]
-    fn component_control_type4_rows_preserve_fields_and_skip_other_types() {
+    fn component_control_keeps_node_and_point_effect_placements() {
         let source = ResourceKey {
             archive: parse_path("controls.rlb").expect("archive"),
             name: resource_name(b"parts.ctl"),
@@ -6857,7 +6860,20 @@ mod tests {
             PreparedControlEffectSection::Parsed(vec![
                 PreparedControlEffectRow {
                     table_index: 0,
+                    row_index: 0,
+                    opcode: 3,
+                    raw_condition: [1, 2, 3],
+                    point_offsets: [10, 0, 0],
+                    selector: 8000,
+                    resource: PreparedControlResourcePair {
+                        archive: fixed_name("effects.rlb"),
+                        name: fixed_name("door_open_02"),
+                    },
+                },
+                PreparedControlEffectRow {
+                    table_index: 0,
                     row_index: 1,
+                    opcode: 4,
                     raw_condition: [0, 7, 9],
                     point_offsets: [104, 105, 106],
                     selector: 17,
@@ -6869,6 +6885,7 @@ mod tests {
                 PreparedControlEffectRow {
                     table_index: 1,
                     row_index: 0,
+                    opcode: 4,
                     raw_condition: [13, 14, 15],
                     point_offsets: [85, 85, 85],
                     selector: 26,
@@ -8854,6 +8871,7 @@ mod tests {
                     PreparedControlEffectRow {
                         table_index: 0,
                         row_index,
+                        opcode: 4,
                         raw_condition: [0; 3],
                         point_offsets: [0, 1, 2],
                         selector: u32::try_from(row_index + 1).expect("small effect selector"),

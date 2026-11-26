@@ -31,6 +31,7 @@ pub(super) fn advance_control_effect_instances(
     control_clock_ms: u32,
     manager_flag: bool,
     owner_capacity: impl Fn(usize) -> Option<(f32, f32)>,
+    owner_motion: impl Fn(usize) -> Option<FxPhaseProvider>,
 ) -> HashMap<ControlEffectInstanceKey, ControlEffectFrameSample> {
     let mut specifications = HashMap::new();
     for slot in ambient_slots {
@@ -69,6 +70,7 @@ pub(super) fn advance_control_effect_instances(
                 }
                 let idle = FxPhaseProvider::idle();
                 let mut provider = idle;
+                let mut resolved = false;
                 if mode == 14 {
                     let capacity = owner_capacity(key.object_index)
                         .and_then(|(remaining, capacity)| idle.with_control_capacity(remaining, capacity));
@@ -79,7 +81,13 @@ pub(super) fn advance_control_effect_instances(
                             eprintln!("render_coverage control_fx_owner_state_stub=1 (missing Control capacity; instance={key:?} mode={mode})");
                         }
                     }
-                } else if state.clock.is_none() && fparkan_fx::fx_time_mode_requires_owner_state(mode) {
+                } else if matches!(mode, 5 | 15) {
+                    if let Some(motion) = owner_motion(key.object_index) {
+                        provider = motion;
+                        resolved = true;
+                    }
+                }
+                if mode != 14 && !resolved && state.clock.is_none() && fparkan_fx::fx_time_mode_requires_owner_state(mode) {
                     eprintln!("render_coverage control_fx_owner_state_stub=1 (idle provider; instance={key:?} mode={mode})");
                 }
                 let clock = state.clock.get_or_insert_with(|| {

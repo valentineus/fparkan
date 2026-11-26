@@ -451,7 +451,7 @@ fn factory2_selected_fx_resources_are_representable<R: ResourceRepository>(
     };
     let selected_rows = rows
         .iter()
-        .filter(|row| Some(row.table_index) == control.initial_effect_group)
+        .filter(|row| row.opcode == 4 && Some(row.table_index) == control.initial_effect_group)
         .collect::<Vec<_>>();
     if selected_rows.len() != selected_opcode4_count {
         return Ok(false);
@@ -8741,6 +8741,7 @@ mod tests {
         PreparedControlEffectRow {
             table_index,
             row_index,
+            opcode: 4,
             raw_condition: [0; 3],
             point_offsets,
             selector: 0,

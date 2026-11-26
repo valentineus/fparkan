@@ -345,7 +345,7 @@ fn firing_effect_row<'a>(
         .find(|&&(table, node, _)| table == group && node as usize == muzzle.node_index)
     {
         rows.iter()
-            .find(|row| row.table_index == group && row.selector == selector)
+            .find(|row| row.opcode == 4 && row.table_index == group && row.selector == selector)
     } else {
         // Separate gun meshes can have one firing record and an effect whose
         // first control point is the same muzzle. Ambiguous rows stay unresolved.
@@ -359,7 +359,8 @@ fn firing_effect_row<'a>(
             return None;
         }
         let mut candidates = rows.iter().filter(|row| {
-            row.table_index == group
+            row.opcode == 4
+                && row.table_index == group
                 && row.raw_condition == [0; 3]
                 && row.point_offsets[0] == muzzle.raw_parameters[1]
         });

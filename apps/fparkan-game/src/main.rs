@@ -10,6 +10,7 @@ mod chassis_animation;
 mod control_effects;
 mod debris;
 mod destruction_effects;
+mod motion_effects;
 use control_effects::{
     activate_firing_flashes, advance_control_effect_instances, owner_control_capacity,
 };
@@ -5681,9 +5682,7 @@ fn append_initial_control_effect_slots(
     sound_slots: &mut Vec<ControlSoundSlot>,
     unsupported_sounds: &mut usize,
 ) -> Result<(), String> {
-    let Some(point_list) = control.point_list.as_ref() else {
-        return Ok(());
-    };
+    let point_list = control.point_list.as_ref();
     let light_owner_scope = u32::try_from(object_index)
         .ok()
         .and_then(|index| index.checked_add(1))
@@ -5697,12 +5696,23 @@ fn append_initial_control_effect_slots(
         let group_index = row.table_index;
         let archive = fixed_effect_field(&row.resource.archive);
         let name = fixed_effect_field(&row.resource.name);
-        let points = control_row_points(point_list, row).ok_or_else(|| {
-            format!(
-                "Control group {group_index} row {} references a missing CPT point {:?}",
-                row.row_index, row.point_offsets
-            )
-        })?;
+        let points = if row.opcode == 4 {
+            let Some(point_list) = point_list else {
+                continue;
+            };
+            Some(control_row_points(point_list, row).ok_or_else(|| {
+                format!(
+                    "Control group {group_index} row {} references a missing CPT point {:?}",
+                    row.row_index, row.point_offsets
+                )
+            })?)
+        } else {
+            // The root-node path covers the authored chassis engine loops.
+            if row.point_offsets[0] != 0 {
+                continue;
+            }
+            None
+        };
         let key = format!("{archive}/{name}");
         let mut record_skip = |reason: &str,
                                count: usize,
@@ -5728,6 +5738,9 @@ fn append_initial_control_effect_slots(
             .get(&key)
             .ok_or_else(|| format!("Control FX {key} was not cached"))?;
         let header = document.header();
+        if row.opcode == 3 && !matches!(header.time_mode, 5 | 15) {
+            continue;
+        }
         let sound_commands = document
             .commands()
             .iter()
@@ -5757,14 +5770,16 @@ fn append_initial_control_effect_slots(
             );
             continue;
         }
-        let owner_node_index =
-            usize::try_from(points[0].raw_signed_field_04)
-                .ok()
-                .filter(|owner_node| {
-                    component_pose_buffer
-                        .is_some_and(|hierarchy| *owner_node < hierarchy.poses.len())
-                        || (*owner_node == 0 && component_pose_buffer.is_none())
-                });
+        let owner_node_index = usize::try_from(
+            points
+                .as_ref()
+                .map_or(0, |points| points[0].raw_signed_field_04),
+        )
+        .ok()
+        .filter(|owner_node| {
+            component_pose_buffer.is_some_and(|hierarchy| *owner_node < hierarchy.poses.len())
+                || (*owner_node == 0 && component_pose_buffer.is_none())
+        });
         let Some(owner_node_index) = owner_node_index else {
             *unsupported_sounds += sound_commands;
             record_skip("owner_node", document.commands().len(), false, None);
@@ -5784,8 +5799,11 @@ fn append_initial_control_effect_slots(
             translation: mission_root.position,
             orientation_radians: mission_root.orientation_raw,
         };
-        let local_from_effect = control_type4_effect_local_matrix(points, header.scale)
-            .ok_or_else(|| format!("Control FX {key} has an invalid type-4 transform"))?;
+        let local_from_effect = match points {
+            Some(points) => control_type4_effect_local_matrix(points, header.scale)
+                .ok_or_else(|| format!("Control FX {key} has an invalid type-4 transform"))?,
+            None => component_scale_matrix(header.scale),
+        };
         let world_from_effect = control_type4_world_from_effect(
             local_from_effect,
             mission_root.scale,
@@ -5814,6 +5832,9 @@ fn append_initial_control_effect_slots(
         );
 
         for (command_index, command) in document.commands().iter().enumerate() {
+            if row.opcode == 3 && command.opcode != FxOpcode::Op2 {
+                continue;
+            }
             if ambient_effect_op1_supported(command) || command.opcode == FxOpcode::Op2 {
                 let slot = ControlEffectSlot {
                     light_owner_scope,
@@ -5853,6 +5874,7 @@ fn append_initial_control_effect_slots(
                 }
                 continue;
             }
+            let Some(points) = points else { continue };
             let Some(kind) = ambient_effect_command_kind(command) else {
                 record_skip("opcode_or_body", 1, false, Some(command_index));
                 continue;
@@ -9893,6 +9915,7 @@ struct StaticVulkanApp {
     control_sound_slots: Vec<ControlSoundSlot>,
     unsupported_control_sounds: usize,
     control_effect_instance_states: HashMap<ControlEffectInstanceKey, ControlEffectInstanceState>,
+    motion_effects: motion_effects::MotionEffects,
     component_pose_buffers: Vec<Vec<Option<NodePoseBuffer>>>,
     component_mount_poses: Vec<Vec<Option<VulkanNodePose>>>,
     dynamic_component_geometry: Vec<Vec<Option<DynamicComponentGeometry>>>,
@@ -10037,6 +10060,7 @@ impl StaticVulkanApp {
             control_sound_slots: preview.control_sound_slots,
             unsupported_control_sounds: preview.unsupported_control_sounds,
             control_effect_instance_states: HashMap::new(),
+            motion_effects: Default::default(),
             component_pose_buffers: preview.component_pose_buffers,
             component_mount_poses: preview.component_mount_poses,
             dynamic_component_geometry: preview.dynamic_component_geometry,
@@ -11272,6 +11296,15 @@ impl StaticVulkanApp {
                     frame.autodemo_reinforcement_unavailable
                 );
             }
+            self.motion_effects.sample(
+                control_clock_ms,
+                &self.mission_render_roots,
+                self.mission_frame
+                    .as_ref()
+                    .map(|previous| &previous.snapshot),
+                &frame.snapshot,
+                engine,
+            );
             if let Some(stop) = frame
                 .mission_event
                 .as_ref()
@@ -11463,6 +11496,7 @@ impl StaticVulkanApp {
                     index,
                 )
             },
+            |index| self.motion_effects.provider(index),
         );
         let firing_flashes = self
             .mission_frame
@@ -19191,6 +19225,7 @@ mod tests {
             250,
             false,
             |_| None,
+            |_| None,
         );
         assert!(update_control_point_lights(
             &mut [inactive],
@@ -19210,6 +19245,7 @@ mod tests {
             SceneSampleId::Replay(2),
             750,
             false,
+            |_| None,
             |_| None,
         );
         let lights = update_control_point_lights(
@@ -19256,6 +19292,7 @@ mod tests {
             1500,
             false,
             |_| None,
+            |_| None,
         );
         assert_eq!(first.len(), 1);
         let key = slot.random_instance_key;
@@ -19283,6 +19320,7 @@ mod tests {
                 1500,
                 false,
                 |_| None,
+                |_| None,
             )[&key],
             first_sample,
             "a repeated read of the same captured update reuses the shared sample"
@@ -19295,6 +19333,7 @@ mod tests {
             SceneSampleId::Replay(8),
             500,
             false,
+            |_| None,
             |_| None,
         );
         let expected = expected_state.advance(SceneSampleId::Replay(8), 500, 1.0);
@@ -19321,6 +19360,7 @@ mod tests {
             4500,
             false,
             |_| None,
+            |_| None,
         );
         assert_eq!(later[&key].phase, Some(1.0));
         assert_eq!(later[&key].elapsed_seconds, 0.5);
@@ -19332,6 +19372,7 @@ mod tests {
             SceneSampleId::Replay(10),
             6500,
             false,
+            |_| None,
             |_| None,
         );
         assert_eq!(restarted[&key].phase, Some(0.0));
@@ -19371,6 +19412,7 @@ mod tests {
                 500,
                 daylight,
                 |_| None,
+                |_| None,
             );
             assert_eq!(samples[&key].phase, Some(expected));
         }
@@ -19386,6 +19428,7 @@ mod tests {
                 SceneSampleId::Replay(11),
                 5_000,
                 false,
+                |_| None,
                 |_| None,
             );
             assert_eq!(
@@ -19410,6 +19453,7 @@ mod tests {
                 5_000,
                 false,
                 |_| Some((remaining, 100.0)),
+                |_| None,
             );
             assert_eq!(samples[&key].phase, expected);
             if expected.is_none() {
@@ -19788,6 +19832,7 @@ mod tests {
         let mut row = PreparedControlEffectRow {
             table_index: 2,
             row_index: 0,
+            opcode: 4,
             raw_condition: [0, 7, 9],
             point_offsets: [0, 1, 2],
             selector: 0,
