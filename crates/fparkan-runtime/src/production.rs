@@ -14,10 +14,12 @@ use super::{
 use fparkan_assets::ResearchTrfDocument;
 use fparkan_path::NormalizedPath;
 use fparkan_prototype::{unit_component_tree, UnitComponentRecord};
+use fparkan_vfs::Vfs;
 use fparkan_world::{
     handle_by_original_id, identity_metadata, transform_state, ObjectHandle, OwnerId,
 };
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 // shortcut: GPU geometry is prepared for a bounded number of live builds.
 // Lift the cap when the renderer can instantiate new roots during a mission.
@@ -69,6 +71,7 @@ pub(super) struct Production {
     reserve_start: usize,
     schemes: Vec<NormalizedPath>,
     player_scheme_count: usize,
+    customized: bool,
     ai_schemes: Vec<(OwnerId, u32, NormalizedPath)>,
     controls: Vec<MissionControlDeviceTableState>,
     plants: Vec<(usize, u32)>,
@@ -166,6 +169,7 @@ impl Production {
         reserve_start: usize,
         schemes: Vec<NormalizedPath>,
         player_scheme_count: usize,
+        customized: bool,
         ai_schemes: Vec<(OwnerId, u32, NormalizedPath)>,
         controls: Vec<MissionControlDeviceTableState>,
         drafts: &[MissionObjectDraft],
@@ -195,6 +199,7 @@ impl Production {
             reserve_start,
             schemes,
             player_scheme_count,
+            customized,
             ai_schemes,
             controls,
             plants: Vec::new(),
@@ -526,27 +531,13 @@ fn order_owned_factory(
         EngineError::Production("scheme size is unsupported by this factory".into())
     })?;
     let (duration_ms, paid) = if is_free {
+        if production.customized && scheme == 0 {
+            clan_scheme_cost(&engine.services.vfs, mission, owner, &draft.unit_components)?;
+        }
         (free_ms, None)
     } else {
-        let cached = mission
-            .research_trf_tables
-            .iter()
-            .find(|table| table.clan_index == usize::from(owner.0));
-        let document;
-        let research = if let Some(table) = cached {
-            &table.document
-        } else {
-            let vfs = engine
-                .services
-                .vfs
-                .as_ref()
-                .ok_or(EngineError::MissingVfs)?;
-            document = load_clan_table(vfs, mission, owner)?;
-            &document
-        };
-        let mut cost = scheme_cost(&draft.unit_components, research, |row| {
-            mission.free_research.learned.contains(&(owner, row))
-        })?;
+        let mut cost =
+            clan_scheme_cost(&engine.services.vfs, mission, owner, &draft.unit_components)?;
         let (table, ore) = factory_resources(mission, plant)?;
         let rate = factory_rate(table)?;
         if rate > RESOURCE_EPSILON {
@@ -619,8 +610,12 @@ pub(super) fn order_script_factory(
             schemes_for_plant(mission, production, index).find(|&(scheme, _)| {
                 let draft =
                     &mission.object_drafts[production.reserve_start + scheme * RESERVE_SLOTS];
-                scheme < production.player_scheme_count
-                    && draft.unit_dat_header_flags == Some(class)
+                let fallback = if production.customized {
+                    scheme == production.player_scheme_count
+                } else {
+                    scheme < production.player_scheme_count
+                };
+                fallback && draft.unit_dat_header_flags == Some(class)
             })
         })
         .map(|(scheme, _)| scheme)
@@ -688,6 +683,29 @@ fn owned_factories<'a>(
 
 fn production_error(error: impl std::fmt::Display) -> EngineError {
     EngineError::Production(error.to_string())
+}
+
+fn clan_scheme_cost(
+    vfs: &Option<Arc<dyn Vfs>>,
+    mission: &LoadedMissionState,
+    owner: OwnerId,
+    records: &[UnitComponentRecord],
+) -> Result<Cost, EngineError> {
+    let document;
+    let research = if let Some(table) = mission
+        .research_trf_tables
+        .iter()
+        .find(|table| table.clan_index == usize::from(owner.0))
+    {
+        &table.document
+    } else {
+        let vfs = vfs.as_ref().ok_or(EngineError::MissingVfs)?;
+        document = load_clan_table(vfs, mission, owner)?;
+        &document
+    };
+    scheme_cost(records, research, |row| {
+        mission.free_research.learned.contains(&(owner, row))
+    })
 }
 
 pub(super) fn scheme_cost(

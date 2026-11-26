@@ -108,7 +108,7 @@ use fparkan_render_vulkan::{
 use fparkan_runtime::{
     apply_projectile_contact, autodemo_camera, board_friendly_warbot, capture_building_with_notice,
     capture_neutral_warbot, create, deploy_mine, disembark_warbot, frame as step_mission_frame,
-    frame_with_player_motion, load_gameplay_mission, load_mission_static_preview,
+    frame_with_player_motion, load_gameplay_mission_with_build_parts, load_mission_static_preview,
     load_mission_static_preview_roots, loaded_mission_assets, loaded_mission_object_drafts,
     loaded_terrain, mission_object_handle, order_lab_research, plan_player_motion_with_collision,
     player_vehicle, prepared_warbot_weapons, projectile_terrain_hit, projectile_unit_hit,
@@ -370,7 +370,7 @@ fn load_requested_mission(engine: &mut Engine, args: &Args) -> Result<LoadedMiss
         mode: args.mission_mode(),
     };
     if !args.viewer {
-        load_gameplay_mission(
+        load_gameplay_mission_with_build_parts(
             engine,
             request,
             MissionStartupInput {
@@ -379,6 +379,7 @@ fn load_requested_mission(engine: &mut Engine, args: &Args) -> Result<LoadedMiss
                 research_creation_gate: false,
             },
             args.build_scheme.as_deref(),
+            &args.build_parts,
         )
     } else if args.preview_roots.get() == 1 {
         load_mission_static_preview(engine, request)
@@ -12871,6 +12872,7 @@ struct Args {
     root: PathBuf,
     mission: String,
     build_scheme: Option<String>,
+    build_parts: Vec<(String, String)>,
     list_missions: bool,
     sim_report_ms: Option<NonZeroU32>,
     viewer: bool,
@@ -12904,6 +12906,7 @@ impl Args {
         let mut root = None;
         let mut mission = None;
         let mut build_scheme = None;
+        let mut build_parts = Vec::new();
         let mut list_missions = false;
         let mut sim_report_ms = None;
         let mut viewer = false;
@@ -12963,6 +12966,14 @@ impl Args {
                         Some(iter.next().cloned().ok_or_else(|| {
                             "--build-scheme requires a Unit DAT path".to_string()
                         })?);
+                }
+                "--build-part" => {
+                    let (from, to) = iter
+                        .next()
+                        .and_then(|value| value.split_once('='))
+                        .filter(|(from, to)| !from.is_empty() && !to.is_empty())
+                        .ok_or("--build-part requires OLD=NEW")?;
+                    build_parts.push((from.to_owned(), to.to_owned()));
                 }
                 "--frames" => {
                     frames = iter
@@ -13065,6 +13076,9 @@ impl Args {
         if build_scheme.is_some() && (viewer || list_missions || sim_report_ms.is_some()) {
             return Err("--build-scheme requires a playable mission window".to_string());
         }
+        if !build_parts.is_empty() && build_scheme.is_none() {
+            return Err("--build-part requires --build-scheme".into());
+        }
         if control_clock_ms.is_some() && frames < 2 {
             return Err(
                 "--control-clock-ms requires --frames of at least 2 to replay the animation clock"
@@ -13081,6 +13095,7 @@ impl Args {
             root,
             mission,
             build_scheme,
+            build_parts,
             list_missions,
             sim_report_ms,
             viewer,
@@ -13099,7 +13114,7 @@ impl Args {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --list-missions\n       fparkan-game --root <path> --mission <number|path> --sim-report <seconds>\n       fparkan-game --root <path> --mission <number|path> [--build-scheme <Unit DAT path>] [--viewer] [--frames <n>] [--atmosphere-seconds <seconds>] [--control-clock-ms <u32>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>] [--readback-sequence-out <directory>]\n--viewer skips mission simulation. Capture, static pose/material and root-limit options select viewer mode. --control-clock-ms replays the scene clock from zero to the selected time over the requested frames; --readback-sequence-out captures each submitted frame and requires that clock.".to_string()
+    "usage: fparkan-game --root <path> --list-missions\n       fparkan-game --root <path> --mission <number|path> --sim-report <seconds>\n       fparkan-game --root <path> --mission <number|path> [--build-scheme <Unit DAT path> [--build-part OLD=NEW]...] [--viewer] [--frames <n>] [--atmosphere-seconds <seconds>] [--control-clock-ms <u32>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>] [--readback-sequence-out <directory>]\n--viewer skips mission simulation. Capture, static pose/material and root-limit options select viewer mode. --control-clock-ms replays the scene clock from zero to the selected time over the requested frames; --readback-sequence-out captures each submitted frame and requires that clock.".to_string()
 }
 
 #[cfg(test)]
@@ -15725,6 +15740,7 @@ mod tests {
                 root: PathBuf::from("testdata/IS"),
                 mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 build_scheme: None,
+                build_parts: Vec::new(),
                 list_missions: false,
                 sim_report_ms: None,
                 viewer: false,

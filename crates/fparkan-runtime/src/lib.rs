@@ -115,6 +115,7 @@ pub use projectile_shield::{
 mod repair_zone;
 mod research;
 mod resource_distribution;
+mod robot_designer;
 mod route_motion;
 mod route_obstacles;
 mod route_traffic;
@@ -173,6 +174,7 @@ pub use projectile::{
 };
 pub use projectile_parts::depleted_chassis_nodes;
 pub use research::order_lab_research;
+pub use robot_designer::{load_gameplay_mission, load_gameplay_mission_with_build_parts};
 pub use unit_combat::{AutoDemoCombatEvent, AutoDemoProjectileType, FiringEffectInstance};
 pub use unit_spawn::SpawnedUnit;
 
@@ -1867,38 +1869,6 @@ pub fn load_mission_with_init_stubs(
     load_gameplay_mission(engine, request, startup_input, None)
 }
 
-/// Loads the gameplay world and prepares the player's optional Unit DAT design.
-///
-/// # Errors
-///
-/// Returns an error if the mission or selected design cannot be loaded.
-pub fn load_gameplay_mission(
-    engine: &mut Engine,
-    request: MissionRequest,
-    startup_input: MissionStartupInput,
-    build_scheme: Option<&str>,
-) -> Result<LoadedMission, EngineError> {
-    if build_scheme.is_some() && request.mode != MissionMode::SingleMission {
-        return Err(EngineError::Production(
-            "build schemes require a player mission".into(),
-        ));
-    }
-    let build_scheme = build_scheme
-        .map(|path| normalize_engine_path("factory Unit DAT", path))
-        .transpose()?;
-    load_mission_with_options(
-        engine,
-        request,
-        MissionLoadOptions {
-            allow_partial_init: true,
-            start_autodemo: true,
-            ..MissionLoadOptions::default()
-        },
-        Some(startup_input),
-        build_scheme.as_ref(),
-    )
-}
-
 /// Loads a mission using the bounded static-preview asset scope.
 ///
 /// This mode preserves map, TMA, graph, construction and registration work,
@@ -1957,9 +1927,9 @@ fn load_mission_with_options(
     request: MissionRequest,
     options: MissionLoadOptions,
     startup_input: Option<MissionStartupInput>,
-    build_scheme: Option<&NormalizedPath>,
+    build_scheme: Option<(&NormalizedPath, &[(String, String)])>,
 ) -> Result<LoadedMission, EngineError> {
-    let vfs = engine.services.vfs.clone().ok_or(EngineError::MissingVfs)?;
+    let mut vfs = engine.services.vfs.clone().ok_or(EngineError::MissingVfs)?;
     let mission_path = normalize_engine_path("mission", &request.key)?;
     let mission_bytes = read_vfs(&vfs, &mission_path)?;
     let config: Arc<[u8]> = if options.asset_scope == MissionAssetScope::Full {
@@ -1981,7 +1951,12 @@ fn load_mission_with_options(
     } else {
         Arc::from(&[][..])
     };
-    let mut build_schemes = if let Some(scheme) = build_scheme {
+    let customized = build_scheme.is_some_and(|(_, changes)| !changes.is_empty());
+    let mut build_schemes = if let Some((scheme, changes)) = build_scheme.filter(|_| customized) {
+        let (overlay, custom) = robot_designer::prepare(vfs, scheme, changes)?;
+        vfs = overlay;
+        vec![custom, scheme.clone()]
+    } else if let Some((scheme, _)) = build_scheme {
         vec![scheme.clone()]
     } else if options.start_autodemo && request.mode == MissionMode::SingleMission {
         production::mission_prebuilds(&config)?
@@ -2040,7 +2015,7 @@ fn load_mission_with_options(
         MISSION_DECODED_PAYLOAD_CACHE_ENTRIES,
     ));
     let repository = asset_manager.repository();
-    let player_scheme_count = build_schemes.len();
+    let player_scheme_count = build_schemes.len() - usize::from(customized);
     let ai_schemes = if options.start_autodemo && request.mode == MissionMode::SingleMission {
         clan_factory_schemes::available(
             &asset_manager,
@@ -2748,6 +2723,7 @@ node_provider_distribution_suspended: false,
                 reserve_start,
                 build_schemes,
                 player_scheme_count,
+                customized,
                 ai_schemes,
                 reserve_controls,
                 &object_drafts[..construction_reserve_start],
