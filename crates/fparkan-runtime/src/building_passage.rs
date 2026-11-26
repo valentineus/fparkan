@@ -7,7 +7,6 @@ use crate::{
     route_obstacles::{model_footprint, Footprint},
     MissionAssets, ObjectHandle, TerrainWorld,
 };
-use fparkan_assets::PreparedComponentControl;
 use fparkan_msh::{node38_fallback_hierarchy, Hallway, HallwayLink};
 use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_terrain::SurfaceQuery;
@@ -17,7 +16,7 @@ use std::collections::VecDeque;
 pub(super) struct CaptureEntrance {
     pub(super) staging: [f32; 2],
     pub(super) capture: [f32; 3],
-    pub(super) legs: Option<VecDeque<PassageLeg>>,
+    pub(super) legs: VecDeque<PassageLeg>,
 }
 
 #[derive(Clone)]
@@ -48,12 +47,13 @@ pub(super) fn capture_entrance(
         .points
         .iter()
         .position(|point| point.flags & 0x40 != 0)?;
-    let toward_capture = links_to(hallway, goal);
     let control = assets
         .object_component_controls
         .get(index)?
         .first()?
         .as_ref()?;
+    let door_for_link = |link: &HallwayLink| linked_door(link, |key| is_bound_door(control, key));
+    let toward_capture = links_to(hallway, goal, |link| door_for_link(link).is_some());
     let hierarchy = node38_fallback_hierarchy(model)?;
     let transform = LegacyIron3dEulerTransform {
         translation: pose.position.map(f32::from_bits),
@@ -82,7 +82,14 @@ pub(super) fn capture_entrance(
             let ground = terrain.height_at(staging).ok()??;
             route_points(terrain, from, [staging[0], staging[1], ground]).ok()??;
             let distance: f32 = (0..3).map(|i| (from[i] - entrance[i]).powi(2)).sum();
-            let legs = passage_legs(index, goal, &toward_capture, hallway, control, project);
+            let legs = passage_legs(
+                index,
+                goal,
+                &toward_capture,
+                hallway,
+                door_for_link,
+                project,
+            )?;
             Some((
                 distance,
                 CaptureEntrance {
@@ -96,7 +103,11 @@ pub(super) fn capture_entrance(
         .map(|(_, entrance)| entrance)
 }
 
-fn links_to(hallway: &Hallway, goal: usize) -> Vec<Option<(usize, usize)>> {
+fn links_to(
+    hallway: &Hallway,
+    goal: usize,
+    traversable: impl Fn(&HallwayLink) -> bool,
+) -> Vec<Option<(usize, usize)>> {
     let mut next = vec![None; hallway.points.len()];
     next[goal] = Some((goal, usize::MAX));
     let mut queue = VecDeque::from([goal]);
@@ -112,8 +123,10 @@ fn links_to(hallway: &Hallway, goal: usize) -> Vec<Option<(usize, usize)>> {
                 continue;
             };
             if let Some(slot @ None) = next.get_mut(neighbor) {
-                *slot = Some((point, index));
-                queue.push_back(neighbor);
+                if traversable(link) {
+                    *slot = Some((point, index));
+                    queue.push_back(neighbor);
+                }
             }
         }
     }
@@ -125,7 +138,7 @@ fn passage_legs(
     goal: usize,
     steps: &[Option<(usize, usize)>],
     hallway: &Hallway,
-    control: &PreparedComponentControl,
+    door_for_link: impl Fn(&HallwayLink) -> Option<Option<usize>>,
     project: impl Fn(usize) -> Option<[f32; 3]>,
 ) -> Option<VecDeque<PassageLeg>> {
     let mut legs = VecDeque::from([PassageLeg {
@@ -134,7 +147,7 @@ fn passage_legs(
     }]);
     while point != goal {
         let (next, link) = steps[point]?;
-        let door = linked_door(&hallway.links[link], control)?;
+        let door = door_for_link(&hallway.links[link])?;
         legs.push_back(PassageLeg {
             position: project(next)?,
             door,
@@ -144,15 +157,15 @@ fn passage_legs(
     Some(legs)
 }
 
-fn linked_door(link: &HallwayLink, control: &PreparedComponentControl) -> Option<Option<usize>> {
+fn linked_door(link: &HallwayLink, is_bound: impl Fn(u32) -> bool) -> Option<Option<usize>> {
     let [[key, mask], ..] = link.access;
     if link.access != [[key, mask]; 4] {
         return None;
     }
-    if [key, mask] == [u32::MAX; 2] {
+    if mask == u32::MAX {
         return Some(None);
     }
-    (mask == 1 && is_bound_door(control, key)).then_some(Some(key as usize))
+    (mask == 1 && is_bound(key)).then_some(Some(key as usize))
 }
 
 impl CapturePassage {
@@ -236,17 +249,24 @@ mod tests {
                 };
                 5
             ],
-            links: [[1, 0], [1, 2], [2, 3], [3, 0], [4, 9]]
-                .map(|endpoints| HallwayLink {
-                    endpoints,
-                    access: [[u32::MAX; 2]; 4],
-                })
-                .to_vec(),
+            links: [
+                ([1, 0], [u32::MAX; 2]),
+                ([1, 2], [7, 1]),
+                ([2, 3], [u32::MAX; 2]),
+                ([3, 0], [u32::MAX, 0]),
+                ([4, 9], [u32::MAX; 2]),
+            ]
+            .map(|(endpoints, pair)| HallwayLink {
+                endpoints,
+                access: [pair; 4],
+            })
+            .to_vec(),
         };
         assert_eq!(
-            links_to(&hallway, 3),
+            links_to(&hallway, 3, |link| linked_door(link, |key| key == 7)
+                .is_some()),
             [
-                Some((3, 3)),
+                Some((1, 0)),
                 Some((2, 1)),
                 Some((3, 2)),
                 Some((3, usize::MAX)),

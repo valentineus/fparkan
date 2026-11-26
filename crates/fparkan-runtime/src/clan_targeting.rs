@@ -51,9 +51,9 @@ pub(super) fn send_capturer(
     let clearance = unit_sphere(assets, unit_id.0 as usize, unit_pose).map_or(0.0, |(_, r)| r);
     let (destination, point, passage) =
         if let Some(entrance) = capture_entrance(assets, terrain, index, pose, from, clearance) {
-            let passage = entrance.legs.map(|legs| CapturePassage {
+            let passage = Some(CapturePassage {
                 building: unit.target,
-                legs,
+                legs: entrance.legs,
                 opening: None,
             });
             (entrance.staging, entrance.capture, passage)
