@@ -108,7 +108,9 @@ mod unit_patrol;
 mod unit_size_class;
 mod unit_spawn;
 mod weapon_pose;
+mod wheel_animation;
 pub use weapon_pose::{initial_component_node_times, WeaponPoseReport};
+pub use wheel_animation::WheelAnimation;
 
 pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoReinforcement, AutoDemoView};
 pub use boarding::{

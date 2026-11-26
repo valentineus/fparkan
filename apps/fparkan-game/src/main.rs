@@ -4765,6 +4765,7 @@ struct ControlAnimationInstance {
     last_sampled_node_times: Vec<Option<f32>>,
     reported_unsupported_fallback: bool,
     door_blends: Vec<f32>,
+    wheels: Option<fparkan_runtime::WheelAnimation>,
 }
 
 #[derive(Clone)]
@@ -4818,6 +4819,18 @@ struct MissionRenderRoot {
     rendered: LivePlacement,
 }
 
+fn live_root_pose(
+    handle: ObjectHandle,
+    snapshot: &WorldSnapshot,
+) -> Option<fparkan_world::TransformState> {
+    let offset = snapshot
+        .transforms
+        .binary_search_by_key(&handle.slot, |(owner, _)| owner.slot)
+        .ok()?;
+    let (owner, state) = snapshot.transforms[offset];
+    (owner == handle).then_some(state)
+}
+
 fn live_placements(
     roots: &mut [Option<MissionRenderRoot>],
     snapshot: &WorldSnapshot,
@@ -4825,12 +4838,7 @@ fn live_placements(
     let mut placements = HashMap::new();
     for (index, root) in roots.iter_mut().enumerate() {
         let Some(root) = root else { continue };
-        let state = snapshot
-            .transforms
-            .binary_search_by_key(&root.handle.slot, |(handle, _)| handle.slot)
-            .ok()
-            .map(|offset| snapshot.transforms[offset])
-            .and_then(|(handle, state)| (handle == root.handle).then_some(state));
+        let state = live_root_pose(root.handle, snapshot);
         // shortcut: retain the last pose until draw slots follow object lifecycle.
         let mut placement = state.map_or(root.rendered, |state| LivePlacement {
             transform: LegacyIron3dEulerTransform {
@@ -7273,7 +7281,14 @@ fn update_control_animation_pose_buffers(
     native_clock_ms: u32,
     aim: Option<(StartingCockpit, f32)>,
 ) -> Result<(), String> {
-    update_gameplay_animation_pose_buffers(instances, pose_buffers, native_clock_ms, aim, None)
+    update_gameplay_animation_pose_buffers(
+        instances,
+        pose_buffers,
+        native_clock_ms,
+        aim,
+        None,
+        None,
+    )
 }
 
 fn update_gameplay_animation_pose_buffers(
@@ -7282,6 +7297,7 @@ fn update_gameplay_animation_pose_buffers(
     native_clock_ms: u32,
     aim: Option<(StartingCockpit, f32)>,
     player_doors: Option<([f32; 3], f32, &[BuildingCollisionBinding])>,
+    motion: Option<(&[Option<MissionRenderRoot>], &WorldSnapshot)>,
 ) -> Result<(), String> {
     for (object_index, components) in instances.iter_mut().enumerate() {
         let Some(object_pose_buffers) = pose_buffers.get_mut(object_index) else {
@@ -7359,6 +7375,13 @@ fn update_gameplay_animation_pose_buffers(
                             &mut instance.door_blends,
                             &mut node_times,
                         );
+                    }
+                }
+            }
+            if let (Some(wheels), Some((roots, snapshot))) = (&mut instance.wheels, motion) {
+                if let Some(root) = roots.get(object_index).and_then(Option::as_ref) {
+                    if let Some(pose) = live_root_pose(root.handle, snapshot) {
+                        wheels.sample(root.handle, pose, &mut node_times);
                     }
                 }
             }
@@ -8354,6 +8377,15 @@ fn static_preview_mesh_and_materials(
                         last_sampled_node_times: Vec::new(),
                         reported_unsupported_fallback: false,
                         door_blends: Vec::new(),
+                        wheels: if component_index == 0
+                            && mission_root
+                                .unit_dat_header_flags
+                                .is_some_and(|class| class & 0x0100_0000 != 0)
+                        {
+                            fparkan_runtime::WheelAnimation::prepare(control, &model.validated)
+                        } else {
+                            None
+                        },
                     });
                 }
             }
@@ -8362,15 +8394,19 @@ fn static_preview_mesh_and_materials(
                 component_bindings,
                 static_animation_frame,
             )?;
+            let wheel_root = control_animation_instances[0]
+                .as_ref()
+                .is_some_and(|instance| instance.wheels.is_some());
             let timeline_moves_component = static_animation_frame.is_none()
-                && control_tree_chain_animates(
-                    component_index,
-                    tree.as_deref(),
-                    component_controls.map_or(&[][..], |controls| controls.as_slice()),
-                    cockpit
-                        .filter(|cockpit| cockpit.object_index == object_index)
-                        .map(|cockpit| cockpit.component_index),
-                );
+                && (wheel_root
+                    || control_tree_chain_animates(
+                        component_index,
+                        tree.as_deref(),
+                        component_controls.map_or(&[][..], |controls| controls.as_slice()),
+                        cockpit
+                            .filter(|cockpit| cockpit.object_index == object_index)
+                            .map(|cockpit| cockpit.component_index),
+                    ));
             // Native AniMesh only resolves global MSH node sockets for EXTO
             // geometry. Internal INTO components use controller/equipment
             // slots, whose `parent_or_link` values are not MSH node indices.
@@ -11357,6 +11393,9 @@ impl StaticVulkanApp {
                     .map(|frame| f32::from_bits(frame.player_pitch_bits)),
             ),
             player_doors,
+            self.mission_frame
+                .as_ref()
+                .map(|frame| (self.mission_render_roots.as_slice(), &frame.snapshot)),
         )?;
         let placements = self
             .mission_frame
@@ -13792,6 +13831,7 @@ mod tests {
             last_sampled_node_times: Vec::new(),
             reported_unsupported_fallback: false,
             door_blends: Vec::new(),
+            wheels: None,
         });
 
         let first = FrameClockSample {
@@ -13896,6 +13936,7 @@ mod tests {
             last_sampled_node_times: Vec::new(),
             reported_unsupported_fallback: false,
             door_blends: Vec::new(),
+            wheels: None,
         })]];
         let hierarchy =
             static_preview_component_pose_buffer(&model, &controls.bindings, None).unwrap();
@@ -13974,6 +14015,7 @@ mod tests {
                     now,
                     None,
                     Some(([hx, hy, hz], 0.292, &app.building_collision_bindings)),
+                    None,
                 )
                 .unwrap();
                 hero =
@@ -14475,6 +14517,7 @@ mod tests {
                 last_sampled_node_times: Vec::new(),
                 reported_unsupported_fallback: false,
                 door_blends: Vec::new(),
+                wheels: None,
             }),
             None,
         ]];
@@ -14817,6 +14860,7 @@ mod tests {
                 last_sampled_node_times: Vec::new(),
                 reported_unsupported_fallback: false,
                 door_blends: Vec::new(),
+                wheels: None,
             }),
             None,
         ]];
@@ -15781,6 +15825,7 @@ mod tests {
             last_sampled_node_times: Vec::new(),
             reported_unsupported_fallback: false,
             door_blends: Vec::new(),
+            wheels: None,
         });
         let turret_pose = |app: &StaticVulkanApp, node| {
             let hierarchy = app.component_pose_buffers[cockpit.object_index]
