@@ -175,8 +175,9 @@ pub use production::{
     order_factory_scheme,
 };
 pub use projectile::{
-    apply_projectile_contact, apply_projectile_hit, load_player_projectile, projectile_terrain_hit,
-    projectile_unit_hit, PlayerProjectile, ProjectileAssets, ProjectileContact, ProjectileNode,
+    apply_projectile_contact, apply_projectile_hit, apply_projectile_impact,
+    load_player_projectile, projectile_terrain_hit, projectile_unit_hit, PlayerProjectile,
+    ProjectileAssets, ProjectileContact, ProjectileImpact, ProjectileNode,
 };
 pub use projectile_parts::depleted_chassis_nodes;
 pub use research::order_lab_research;

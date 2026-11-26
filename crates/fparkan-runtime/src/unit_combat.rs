@@ -1,5 +1,5 @@
 use super::{
-    apply_projectile_contact,
+    apply_projectile_impact,
     autodemo::MOBILE_UNIT,
     combat_report::{CombatObject, CombatReport},
     player_weapon::prepare_unit_weapons,
@@ -9,7 +9,7 @@ use super::{
     unit_patrol::UnitPatrol,
     weapon_pose::WeaponPoses,
     Engine, MissionAssets, MissionDocument, MissionObjectDraft, ObjectHandle, PlayerProjectile,
-    PlayerWeapons,
+    PlayerWeapons, ProjectileImpact,
 };
 use fparkan_vfs::Vfs;
 use fparkan_world::{identity_metadata, transform_state};
@@ -468,16 +468,20 @@ impl AutoDemoCombat {
                 let target = CombatObject::read(&engine.world, hit.handle);
                 match data
                     .volume
-                    .map(|volume| apply_projectile_contact(engine, hit, volume))
+                    .map(|volume| apply_projectile_impact(engine, hit, volume))
                 {
-                    Some(Ok(Some((_, true)))) => {
+                    Some(Ok(ProjectileImpact::ShieldAbsorbed)) => {}
+                    Some(Ok(ProjectileImpact::Damage { removed: true, .. })) => {
                         self.report.destroyed(flight.shooter_identity, target, now);
                         events.push(AutoDemoCombatEvent::Destroyed {
                             shooter: flight.shooter,
                             target: hit.handle,
                         });
                     }
-                    Some(Ok(Some((remaining, false)))) => {
+                    Some(Ok(ProjectileImpact::Damage {
+                        remaining,
+                        removed: false,
+                    })) => {
                         if let Some(node) = hit.building_node() {
                             events.push(AutoDemoCombatEvent::BuildingHit {
                                 shooter: flight.shooter,

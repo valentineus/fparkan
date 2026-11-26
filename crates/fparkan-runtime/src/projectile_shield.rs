@@ -279,8 +279,8 @@ mod tests {
     #[ignore = "requires licensed corpus"]
     fn licensed_autodemo_shield_blocks_and_then_exposes_one_sector() {
         use crate::{
-            apply_projectile_contact, create, load_gameplay_mission, EngineServices, MissionMode,
-            MissionRequest, MissionStartupInput,
+            apply_projectile_impact, create, load_gameplay_mission, EngineServices, MissionMode,
+            MissionRequest, MissionStartupInput, ProjectileImpact,
         };
         use fparkan_vfs::DirectoryVfs;
         use std::sync::Arc;
@@ -337,10 +337,9 @@ mod tests {
         let (center, radius) = engine.shield_impacts.as_ref().unwrap().local_spheres[0]
             .expect("stock AutoDemo warbot enclosure");
         assert!(center[2] > 0.0 && radius > 6.0);
-        assert!(
-            apply_projectile_contact(&mut engine, contact, capacity * 0.5)
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            apply_projectile_impact(&mut engine, contact, capacity * 0.5).unwrap(),
+            ProjectileImpact::ShieldAbsorbed
         );
         let impacts = take_shield_impacts(&mut engine);
         let [impact] = impacts.as_slice() else {

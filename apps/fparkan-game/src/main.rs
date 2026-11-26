@@ -107,7 +107,7 @@ use fparkan_render_vulkan::{
     VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex,
 };
 use fparkan_runtime::{
-    apply_projectile_contact, autodemo_camera, board_friendly_warbot, capture_building_with_notice,
+    apply_projectile_impact, autodemo_camera, board_friendly_warbot, capture_building_with_notice,
     capture_neutral_warbot, create, deploy_mine, disembark_warbot, frame as step_mission_frame,
     frame_with_player_motion, load_gameplay_mission_with_build_parts, load_mission_static_preview,
     load_mission_static_preview_roots, loaded_mission_assets, loaded_mission_object_drafts,
@@ -117,7 +117,7 @@ use fparkan_runtime::{
     starting_player_weapons, AutoDemoCamera, AutoDemoView, BuildingMeshNode, Engine, EngineError,
     EngineServices, FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode,
     MissionObjectDraft, MissionRequest, MissionStartupInput, PlayerMotion, PlayerProjectile,
-    PlayerWeapons, StartingCockpit, SIMULATION_COVERAGE,
+    PlayerWeapons, ProjectileImpact, StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_runtime::{load_mission_with_init_stubs, plan_player_motion};
@@ -10533,15 +10533,22 @@ impl StaticVulkanApp {
                     }) {
                         "communicator-field"
                     } else if let Some(hit) = unit_contact {
-                        match draw.volume.map(|volume| apply_projectile_contact(engine, hit, volume)).transpose() {
-                            Ok(Some(Some((remaining, removed)))) => eprintln!(
+                        let outcome = draw
+                            .volume
+                            .map(|volume| apply_projectile_impact(engine, hit, volume))
+                            .transpose();
+                        match &outcome {
+                            Ok(Some(ProjectileImpact::ShieldAbsorbed)) => {},
+                            Ok(Some(ProjectileImpact::Damage { remaining, removed })) => eprintln!(
                                 "player_projectile_hit shooter={} pool={pool} target={} remaining={remaining} removed={removed} queue_time_ms={clock_ms}", shooter.slot, hit.handle.slot,
                             ),
                             outcome => eprintln!(
                                 "sim_coverage player_projectile_target_stub=1 target={} result={outcome:?}", hit.handle.slot,
                             ),
                         }
-                        if hit.building_node().is_some() {
+                        if matches!(outcome, Ok(Some(ProjectileImpact::ShieldAbsorbed))) {
+                            "shield"
+                        } else if hit.building_node().is_some() {
                             "building"
                         } else {
                             "unit"

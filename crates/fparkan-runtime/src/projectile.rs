@@ -276,18 +276,64 @@ pub(super) fn unit_sphere(
     Some((center, radius))
 }
 
+/// Result of applying a projectile to a building or unit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProjectileImpact {
+    /// The shield took the entire hit and the hull was untouched.
+    ShieldAbsorbed,
+    /// The contacted part lost health, or the unit was destroyed.
+    Damage {
+        /// Health left on the contacted part.
+        remaining: f32,
+        /// Whether the impact removed the whole unit.
+        removed: bool,
+    },
+    /// No damage result was available for the contacted target or part.
+    Unresolved,
+}
+
 /// Applies projectile damage to the contacted part of a building or unit.
+/// Returns the hull damage result when the hit reached the hull.
 pub fn apply_projectile_contact(
     engine: &mut Engine,
     contact: ProjectileContact,
     volume: f32,
 ) -> Result<Option<(f32, bool)>, ControlResourceAccessError> {
+    Ok(match apply_projectile_impact(engine, contact, volume)? {
+        ProjectileImpact::Damage { remaining, removed } => Some((remaining, removed)),
+        ProjectileImpact::ShieldAbsorbed | ProjectileImpact::Unresolved => None,
+    })
+}
+
+/// Applies a projectile and distinguishes shield absorption from unresolved damage.
+pub fn apply_projectile_impact(
+    engine: &mut Engine,
+    contact: ProjectileContact,
+    volume: f32,
+) -> Result<ProjectileImpact, ControlResourceAccessError> {
     let key = match contact.node {
-        Some(ProjectileNode::CaptureBarrier) => return Ok(None),
+        Some(ProjectileNode::CaptureBarrier) => return Ok(ProjectileImpact::Unresolved),
         None | Some(ProjectileNode::Chassis(0)) => None,
         Some(ProjectileNode::Chassis(key) | ProjectileNode::Building(key)) => Some(key),
     };
-    let volume = super::projectile_shield::absorb(engine, contact, volume);
+    let unabsorbed = super::projectile_shield::absorb(engine, contact, volume);
+    if volume > 0.0 && unabsorbed == 0.0 {
+        return Ok(ProjectileImpact::ShieldAbsorbed);
+    }
+    Ok(
+        match apply_contact_damage(engine, contact, key, unabsorbed)? {
+            Some((remaining, removed)) => ProjectileImpact::Damage { remaining, removed },
+            None => ProjectileImpact::Unresolved,
+        },
+    )
+}
+
+fn apply_contact_damage(
+    engine: &mut Engine,
+    contact: ProjectileContact,
+    key: Option<u32>,
+    volume: f32,
+) -> Result<Option<(f32, bool)>, ControlResourceAccessError> {
     let table = engine.loaded.as_ref().and_then(|mission| {
         mission
             .control_device_tables
