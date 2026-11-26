@@ -3354,6 +3354,14 @@ pub fn autodemo_projectile_types(engine: &Engine) -> &[AutoDemoProjectileType] {
         .map_or(&[], unit_combat::AutoDemoCombat::types)
 }
 
+/// Asset sources referenced by autonomous weapon firing events.
+pub fn autonomous_weapon_effects(engine: &Engine) -> &[(String, String)] {
+    engine
+        .autodemo_combat
+        .as_ref()
+        .map_or(&[], unit_combat::AutoDemoCombat::weapon_effects)
+}
+
 /// Active autonomous flights in the current world.
 pub fn autodemo_projectiles(
     engine: &Engine,
@@ -16576,6 +16584,7 @@ mod tests {
                         shooter,
                         target,
                         projectile,
+                        ..
                     } => {
                         assert_ne!(shooter, target);
                         assert!(projectile < autodemo_projectile_types(&engine).len());

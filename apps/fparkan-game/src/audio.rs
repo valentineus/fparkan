@@ -1871,6 +1871,68 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed GOG assets and a usable OS audio output"]
+    fn stock_autonomous_shot_starts_a_spatial_voice_at_its_muzzle() {
+        use fparkan_runtime::{
+            autonomous_weapon_effects, create, frame, load_gameplay_mission, AutoDemoCombatEvent,
+            EngineServices, MissionMode, MissionRequest, MissionStartupInput,
+        };
+        const MISSION: &str = "MISSIONS/Autodemo.00/data.tma";
+        let root = std::env::var_os("FPARKAN_GAME_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\GOG Games\Parkan - Iron Strategy"));
+        let vfs: Arc<dyn Vfs> = Arc::new(fparkan_vfs::DirectoryVfs::new(&root));
+        let mut engine = create(EngineServices::new(vfs.clone())).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: MISSION.into(),
+                mode: MissionMode::AutoDemo,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let sounds: Vec<_> = autonomous_weapon_effects(&engine)
+            .iter()
+            .map(|(archive, name)| crate::shot_sound::load(&root, archive, name))
+            .collect();
+        for now in (0..=60_000).step_by(50) {
+            let frame = frame(&mut engine, now).unwrap();
+            for event in &frame.autodemo_combat_events {
+                let AutoDemoCombatEvent::Shot {
+                    effect: Some(effect),
+                    muzzle_bits,
+                    ..
+                } = *event
+                else {
+                    continue;
+                };
+                if sounds[effect].is_none() {
+                    continue;
+                }
+                let mut audio = GameAudio::new(vfs, MISSION).expect("open game audio");
+                audio.set_paused(true);
+                crate::shot_sound::play_autonomous(
+                    &sounds,
+                    std::slice::from_ref(event),
+                    &mut audio,
+                );
+                let voice = audio.one_shots.last().expect("queued spatial weapon sound");
+                assert_eq!(
+                    voice.player.state.lock().unwrap().emitter_position,
+                    muzzle_bits.map(f32::from_bits)
+                );
+                return;
+            }
+        }
+        panic!("no stock autonomous shot selected a supported sound effect");
+    }
+
+    #[test]
+    #[ignore = "requires installed GOG assets and a usable OS audio output"]
     fn starts_pauses_and_drops_gog_audio() {
         let root = std::env::var_os("FPARKAN_GAME_ROOT")
             .map(std::path::PathBuf::from)

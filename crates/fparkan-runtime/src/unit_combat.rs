@@ -43,6 +43,10 @@ pub enum AutoDemoCombatEvent {
         target: ObjectHandle,
         /// Projectile type in render-pool order.
         projectile: usize,
+        /// Optional weapon effect in shared resource order.
+        effect: Option<usize>,
+        /// World-space muzzle position as raw IEEE-754 coordinates.
+        muzzle_bits: [u32; 3],
     },
     /// A projectile exhausted a unit's health.
     Destroyed {
@@ -70,6 +74,7 @@ pub(super) struct AutoDemoCombat {
     hostile: Vec<Vec<bool>>,
     guard_clans: Vec<bool>,
     projectiles: Vec<AutoDemoProjectileType>,
+    weapon_effects: Vec<(String, String)>,
     flights: Vec<Flight>,
     finished_segments: Vec<(usize, [[f32; 3]; 2])>,
     pose_failures: super::WeaponPoseReport,
@@ -92,6 +97,7 @@ struct Unit {
     original_id: u32,
     weapons: PlayerWeapons,
     slots: Vec<Option<usize>>,
+    effects: Vec<Option<usize>>,
     poses: WeaponPoses,
 }
 
@@ -135,6 +141,7 @@ impl AutoDemoCombat {
             hostile,
             guard_clans,
             projectiles: Vec::new(),
+            weapon_effects: Vec::new(),
             flights: Vec::new(),
             finished_segments: Vec::new(),
             pose_failures: super::WeaponPoseReport::default(),
@@ -195,6 +202,26 @@ impl AutoDemoCombat {
                     Some(slot)
                 })
                 .collect();
+            let effects = weapons
+                .weapons()
+                .iter()
+                .map(|weapon| {
+                    let (archive, name) = weapon.effect.as_ref()?;
+                    let index = battle
+                        .weapon_effects
+                        .iter()
+                        .position(|(source_archive, source_name)| {
+                            source_archive.eq_ignore_ascii_case(archive)
+                                && source_name.eq_ignore_ascii_case(name)
+                        })
+                        .unwrap_or_else(|| {
+                            let index = battle.weapon_effects.len();
+                            battle.weapon_effects.push((archive.clone(), name.clone()));
+                            index
+                        });
+                    Some(index)
+                })
+                .collect();
             battle.unavailable += usize::from(weapons.weapons().is_empty());
             if weapons.weapons().is_empty() {
                 battle.report.unavailable(object, "empty_weapon_bank", 0, 1);
@@ -209,6 +236,7 @@ impl AutoDemoCombat {
                 index,
                 weapons,
                 slots,
+                effects,
                 poses: WeaponPoses::new(draft, assets, index),
                 original_id: draft.original_id.map_or(handle.slot, |id| id.0),
             });
@@ -238,6 +266,10 @@ impl AutoDemoCombat {
 
     pub(super) fn types(&self) -> &[AutoDemoProjectileType] {
         &self.projectiles
+    }
+
+    pub(super) fn weapon_effects(&self) -> &[(String, String)] {
+        &self.weapon_effects
     }
 
     pub(super) fn guard_clan_count(&self) -> usize {
@@ -555,6 +587,8 @@ impl AutoDemoCombat {
                         shooter: unit.handle,
                         target,
                         projectile,
+                        effect: unit.effects[slot],
+                        muzzle_bits: from.map(f32::to_bits),
                     });
                 } else {
                     unavailable += 1;
@@ -662,6 +696,7 @@ mod tests {
         let mut observed_shots = 0;
         let mut observed_aimed_turret = false;
         let mut observed_finished_segment = false;
+        let mut observed_weapon_effect = false;
         let mut observed_unavailable = engine.autodemo_combat.as_ref().unwrap().unavailable as u64;
         for now in (0..=120_000).step_by(50) {
             let frame = frame(&mut engine, now).unwrap();
@@ -698,7 +733,28 @@ mod tests {
                 observed_unavailable
             );
             assert!(combat.flights.len() >= shots);
-            for flight in combat.flights.iter().rev().take(shots) {
+            for (event, flight) in frame
+                .autodemo_combat_events
+                .iter()
+                .filter(|event| matches!(event, AutoDemoCombatEvent::Shot { .. }))
+                .rev()
+                .zip(combat.flights.iter().rev())
+            {
+                let AutoDemoCombatEvent::Shot {
+                    shooter,
+                    effect,
+                    muzzle_bits,
+                    ..
+                } = *event
+                else {
+                    unreachable!()
+                };
+                assert_eq!(flight.shooter, shooter);
+                assert_eq!(flight.pose.position.map(f32::to_bits), muzzle_bits);
+                if let Some(effect) = effect {
+                    assert!(effect < combat.weapon_effects().len());
+                    observed_weapon_effect = true;
+                }
                 let shooter = combat
                     .units
                     .iter()
@@ -745,6 +801,7 @@ mod tests {
                     observed_finished_segment,
                     "no segment survived its projectile's removal"
                 );
+                assert!(observed_weapon_effect, "no shot carried its weapon effect");
                 return;
             }
         }

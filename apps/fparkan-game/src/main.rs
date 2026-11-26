@@ -15,6 +15,7 @@ mod mission_pause;
 mod player_collision;
 mod projectile_render;
 mod projectile_trail;
+mod shot_sound;
 use projectile_render::{prepare_projectile_draw, ProjectileDraw};
 mod script_coverage;
 mod sun_visibility;
@@ -9630,15 +9631,10 @@ fn run_static_vulkan_mode(
                             pools.len() - 1
                         });
                     pools[pool].2.push(weapon.interval_ms());
-                    let sound = weapon.effect.as_ref().and_then(|(archive, name)| {
-                        let bytes =
-                            load_resource_entry_bytes_from_root(root, archive, name).ok()?;
-                        let effect = decode_fxid(bytes).ok()?;
-                        effect
-                            .commands()
-                            .iter()
-                            .find_map(Op2SoundCommand::from_command)
-                    });
+                    let sound = weapon
+                        .effect
+                        .as_ref()
+                        .and_then(|(archive, name)| shot_sound::load(root, archive, name));
                     if sound.is_none() {
                         eprintln!(
                             "sim_coverage player_weapon_sound_stub=1 object={index} projectile={}",
@@ -9689,6 +9685,12 @@ fn run_static_vulkan_mode(
                 }
             }
         }).collect()
+    });
+    let autonomous_shot_sounds = mission_engine.as_ref().map_or_else(Vec::new, |engine| {
+        fparkan_runtime::autonomous_weapon_effects(engine)
+            .iter()
+            .map(|(archive, name)| shot_sound::load(root, archive, name))
+            .collect()
     });
     #[cfg(windows)]
     let mission_hints = if mission_engine.is_some() && demo_camera.is_none() {
@@ -9746,6 +9748,7 @@ fn run_static_vulkan_mode(
     }
     app.projectile_draws = projectile_draws;
     app.autodemo_draws = autodemo_draws;
+    app.autonomous_shot_sounds = autonomous_shot_sounds;
     if let Some(engine) = &app.mission_engine {
         app.mission_render_roots = loaded_mission_object_drafts(engine)
             .unwrap_or_default()
@@ -9923,6 +9926,7 @@ struct StaticVulkanApp {
     player_weapon_banks: HashMap<ObjectHandle, PlayerWeapons>,
     projectile_draws: Vec<Option<ProjectileDraw>>,
     autodemo_draws: Vec<Option<ProjectileDraw>>,
+    autonomous_shot_sounds: Vec<Option<Op2SoundCommand>>,
     player_fire_held: bool,
     player_fire_pressed: bool,
     player_capture_pressed: bool,
@@ -10068,6 +10072,7 @@ impl StaticVulkanApp {
             player_weapon_banks: HashMap::new(),
             projectile_draws: Vec::new(),
             autodemo_draws: Vec::new(),
+            autonomous_shot_sounds: Vec::new(),
             player_fire_held: false,
             player_fire_pressed: false,
             player_capture_pressed: false,
@@ -10671,7 +10676,7 @@ impl StaticVulkanApp {
         for event in &frame.autodemo_combat_events {
             use fparkan_runtime::AutoDemoCombatEvent::{BuildingHit, Destroyed, Shot};
             match *event {
-                Shot { shooter, target, projectile } => eprintln!(
+                Shot { shooter, target, projectile, .. } => eprintln!(
                     "{combat}_shot shooter={} target={} projectile={projectile} queue_time_ms={clock_ms}", shooter.slot, target.slot
                 ),
                 Destroyed { shooter, target } => eprintln!(
@@ -11272,6 +11277,13 @@ impl StaticVulkanApp {
                 .chain(&frame.clan_notices)
             {
                 self.present_mission_notice(notice, control_clock_ms);
+            }
+            if let Some(audio) = self.audio.as_mut() {
+                shot_sound::play_autonomous(
+                    &self.autonomous_shot_sounds,
+                    &frame.autodemo_combat_events,
+                    audio,
+                );
             }
             self.mission_frame = Some(frame);
         }

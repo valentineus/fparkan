@@ -1,6 +1,7 @@
 use crate::{Engine, StartingCockpit};
 use fparkan_assets::{
     PreparedComponentControl, PreparedControlEffectSection, PreparedControlPoint,
+    PreparedControlTimelineRow,
 };
 
 /// A unit's selectable weapon devices, in resource order.
@@ -300,26 +301,7 @@ fn prepare_weapons(
             } else {
                 return None;
             };
-            let effect = match &control.effect_section {
-                PreparedControlEffectSection::Parsed(rows) => control
-                    .node_effect_links
-                    .iter()
-                    .find(|&&(group, node, _)| {
-                        Some(group) == control.initial_effect_group
-                            && node as usize == row.node_index
-                    })
-                    .and_then(|&(group, _, selector)| {
-                        rows.iter()
-                            .find(|row| row.table_index == group && row.selector == selector)
-                    })
-                    .and_then(|row| {
-                        Some((
-                            crate::bounded_ascii_c_string(&row.resource.archive)?,
-                            crate::bounded_ascii_c_string(&row.resource.name)?,
-                        ))
-                    }),
-                _ => None,
-            };
+            let effect = firing_effect(control, row);
             Some(PlayerWeapon {
                 component_index,
                 control_record_index,
@@ -339,6 +321,50 @@ fn prepare_weapons(
             })
         })
         .collect()
+}
+
+fn firing_effect(
+    control: &PreparedComponentControl,
+    muzzle: &PreparedControlTimelineRow,
+) -> Option<(String, String)> {
+    let PreparedControlEffectSection::Parsed(rows) = &control.effect_section else {
+        return None;
+    };
+    let group = control.initial_effect_group?;
+    let row = if let Some(&(_, _, selector)) = control
+        .node_effect_links
+        .iter()
+        .find(|&&(table, node, _)| table == group && node as usize == muzzle.node_index)
+    {
+        rows.iter()
+            .find(|row| row.table_index == group && row.selector == selector)?
+    } else {
+        // Separate gun meshes can have one firing record and an effect whose
+        // first control point is the same muzzle. Ambiguous rows stay unresolved.
+        if control
+            .typed_records
+            .iter()
+            .filter(|record| record.tag == 2)
+            .nth(1)
+            .is_some()
+        {
+            return None;
+        }
+        let mut candidates = rows.iter().filter(|row| {
+            row.table_index == group
+                && row.raw_condition == [0; 3]
+                && row.point_offsets[0] == muzzle.raw_parameters[1]
+        });
+        let row = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
+        row
+    };
+    Some((
+        crate::bounded_ascii_c_string(&row.resource.archive)?,
+        crate::bounded_ascii_c_string(&row.resource.name)?,
+    ))
 }
 
 pub(super) fn prepare_unit_weapons(controls: &[Option<PreparedComponentControl>]) -> PlayerWeapons {
