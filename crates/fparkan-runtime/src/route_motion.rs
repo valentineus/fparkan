@@ -7,6 +7,8 @@ use crate::{
 use fparkan_terrain::{NavigationQuery, RouteRequest};
 use std::collections::VecDeque;
 
+pub(super) const WAYPOINT_TOLERANCE: f32 = 0.05;
+
 pub(super) fn route_points(
     terrain: &TerrainWorld,
     from: [f32; 3],
@@ -42,21 +44,25 @@ pub(super) fn follow_route(
     points: &mut VecDeque<[f32; 2]>,
     speed: f32,
     mut seconds: f32,
-    obstacles: &[Footprint],
+    buildings: &[Footprint],
+    traffic: &[Footprint],
     mut height_at: impl FnMut([f32; 2]) -> Result<Option<f32>, EngineError>,
-) -> Result<TransformState, EngineError> {
+) -> Result<(TransformState, Footprint), EngineError> {
     let [mut x, mut y, mut z] = pose.position.map(f32::from_bits);
+    let mut swept = Footprint::point([x, y]);
     while seconds > 0.0 && !points.is_empty() {
-        if !open_leg([x, y], points, obstacles, |point| {
+        if !open_leg([x, y], points, buildings, traffic, |point| {
             height_at(point).map(|z| z.is_some())
         })? {
-            points.clear();
+            if traffic.is_empty() {
+                points.clear();
+            }
             break;
         }
         let Some(&target) = points.front() else { break };
         let [dx, dy] = [target[0] - x, target[1] - y];
         let distance = dx.hypot(dy);
-        if distance <= 0.05 {
+        if distance <= WAYPOINT_TOLERANCE {
             points.pop_front();
             continue;
         }
@@ -80,6 +86,7 @@ pub(super) fn follow_route(
         };
         let offset = height_at([x, y])?.map_or(0.0, |height| z - height);
         [x, y] = xy;
+        swept.include(xy);
         z = ground + offset;
         pose.position = [x, y, z].map(f32::to_bits);
         if !reached {
@@ -88,7 +95,7 @@ pub(super) fn follow_route(
         points.pop_front();
         seconds -= travel_time;
     }
-    Ok(pose)
+    Ok((pose, swept))
 }
 
 #[cfg(test)]
@@ -102,7 +109,10 @@ mod tests {
             ..Default::default()
         };
         let mut route = VecDeque::from([[0.0, 0.0], [0.0, 1.0], [4.0, 1.0]]);
-        let end = follow_route(start, &mut route, 2.0, 2.0, &[], |[x, y]| Ok(Some(x + y))).unwrap();
+        let (end, _) = follow_route(start, &mut route, 2.0, 2.0, &[], &[], |[x, y]| {
+            Ok(Some(x + y))
+        })
+        .unwrap();
         let [x, y, z] = end.position.map(f32::from_bits);
         let expected_x = 3.0 - std::f32::consts::FRAC_PI_2;
         assert!((x - expected_x).abs() < 0.000_01);

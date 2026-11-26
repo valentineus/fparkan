@@ -3,9 +3,9 @@ use super::{
     boarding::WARBOT_CLASS,
     next_crt_rand,
     patrol_points::{PatrolPointReport, PatrolPoints},
-    projectile::unit_sphere,
     route_motion::{follow_route, route_points, turn_toward},
     route_obstacles::BuildingFootprints,
+    route_traffic::FrameTraffic,
     unit_combat::CombatTarget,
     unit_speed::{order_speed, UnitSpeedKind, UnitSpeedReport},
     EngineError, LoadedMissionState, MissionDocument, MissionObjectDraft, MissionScriptBundle,
@@ -430,9 +430,12 @@ impl UnitPatrol {
         });
         let seconds = now_ms.saturating_sub(state.clock_ms) as f32 * 0.001;
         state.clock_ms = state.clock_ms.max(now_ms);
-        if seconds > 0.0 && !state.units.is_empty() {
+        let mut traffic = if seconds > 0.0 && !state.units.is_empty() {
             state.buildings.refresh(world, mission);
-        }
+            FrameTraffic::read(world, mission)
+        } else {
+            FrameTraffic::default()
+        };
         let mut poses = Vec::new();
         for unit in &mut state.units {
             let Ok(before) = transform_state(world, unit.handle) else {
@@ -619,18 +622,22 @@ impl UnitPatrol {
             } else {
                 9.0
             };
-            let clearance = motion_object
-                .original_id
-                .and_then(|id| {
-                    let (center, radius) =
-                        unit_sphere(&mission.mission_assets, id as usize, before)?;
-                    Some(radius + (center[0] - from[0]).hypot(center[1] - from[1]))
-                })
-                .unwrap_or(0.0);
-            let obstacles = state.buildings.with_clearance(clearance);
-            let after = follow_route(before, &mut unit.points, speed, seconds, &obstacles, |xy| {
-                terrain.height_at(xy).map_err(EngineError::Terrain)
-            })?;
+            let clearance = traffic.radius(unit.handle);
+            let Some(neighbors) = traffic.blockers(unit.handle, [from[0], from[1]], clearance)
+            else {
+                continue;
+            };
+            let buildings = state.buildings.with_clearance(clearance);
+            let (after, swept) = follow_route(
+                before,
+                &mut unit.points,
+                speed,
+                seconds,
+                &buildings,
+                &neighbors,
+                |xy| terrain.height_at(xy).map_err(EngineError::Terrain),
+            )?;
+            traffic.reserve(unit.handle, swept);
             if after != before {
                 poses.push((unit.handle, before, after));
             }

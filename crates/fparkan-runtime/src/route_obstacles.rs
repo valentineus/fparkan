@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, VecDeque};
 // skip a node without putting the next leg back inside the obstacle.
 const CORNER_GAP: f32 = 0.1;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Footprint {
     min: [f32; 2],
     max: [f32; 2],
@@ -118,18 +118,29 @@ fn model_footprint(
 }
 
 impl Footprint {
-    fn expanded(self, margin: f32) -> Self {
+    pub(super) fn point(xy: [f32; 2]) -> Self {
+        Self { min: xy, max: xy }
+    }
+
+    pub(super) fn include(&mut self, xy: [f32; 2]) {
+        for (axis, value) in xy.into_iter().enumerate() {
+            self.min[axis] = self.min[axis].min(value);
+            self.max[axis] = self.max[axis].max(value);
+        }
+    }
+
+    pub(super) fn expanded(self, margin: f32) -> Self {
         Self {
             min: self.min.map(|v| v - margin),
             max: self.max.map(|v| v + margin),
         }
     }
 
-    fn contains(self, p: [f32; 2]) -> bool {
+    pub(super) fn contains(self, p: [f32; 2]) -> bool {
         (0..2).all(|axis| p[axis] >= self.min[axis] && p[axis] <= self.max[axis])
     }
 
-    fn intersects(self, from: [f32; 2], to: [f32; 2]) -> bool {
+    pub(super) fn intersects(self, from: [f32; 2], to: [f32; 2]) -> bool {
         let (mut first, mut last) = (0.0_f32, 1.0_f32);
         for axis in 0..2 {
             let delta = to[axis] - from[axis];
@@ -176,29 +187,31 @@ fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
 pub(super) fn open_leg(
     from: [f32; 2],
     points: &mut VecDeque<[f32; 2]>,
-    obstacles: &[Footprint],
+    buildings: &[Footprint],
+    traffic: &[Footprint],
     mut walkable: impl FnMut([f32; 2]) -> Result<bool, EngineError>,
 ) -> Result<bool, EngineError> {
-    while points.len() > 1 && obstacles.iter().any(|o| o.contains(points[0])) {
+    let obstacles = buildings.iter().chain(traffic);
+    while points.len() > 1 && obstacles.clone().any(|o| o.contains(points[0])) {
         points.pop_front();
     }
     let Some(&goal) = points.front() else {
         return Ok(false);
     };
-    if !obstacles.iter().any(|o| o.intersects(from, goal)) {
+    if !obstacles.clone().any(|o| o.intersects(from, goal)) {
         return Ok(true);
     }
-    let contains = |point| obstacles.iter().any(|o| o.contains(point));
+    let contains = |point| obstacles.clone().any(|o| o.contains(point));
 
     if contains(from) {
         let mut exits: Vec<_> = obstacles
-            .iter()
+            .clone()
             .filter(|o| o.contains(from))
             .flat_map(|o| o.exits(from))
             .filter(|&p| {
                 !contains(p)
                     && !obstacles
-                        .iter()
+                        .clone()
                         .any(|o| !o.contains(from) && o.intersects(from, p))
             })
             .collect();
@@ -216,9 +229,10 @@ pub(super) fn open_leg(
 
     let mut nodes = vec![from];
     let mut end = goal;
+    let occupied = traffic.iter().any(|body| body.contains(goal));
     if contains(goal) {
         let mut exits: Vec<_> = obstacles
-            .iter()
+            .clone()
             .filter(|o| o.contains(goal))
             .flat_map(|o| o.exits(goal))
             .filter(|&p| !contains(p))
@@ -236,10 +250,13 @@ pub(super) fn open_leg(
         };
         end = exit;
     }
+    if occupied && distance(from, end) <= crate::route_motion::WAYPOINT_TOLERANCE {
+        return Ok(false);
+    }
     nodes.push(end);
-    if obstacles.iter().any(|o| o.intersects(from, end)) {
+    if obstacles.clone().any(|o| o.intersects(from, end)) {
         for p in obstacles
-            .iter()
+            .clone()
             .flat_map(|o| o.corners())
             .filter(|&p| !contains(p))
         {
@@ -251,7 +268,9 @@ pub(super) fn open_leg(
     let Some(path) = shortest_path(&nodes, obstacles) else {
         return Ok(false);
     };
-    points.pop_front();
+    if !occupied {
+        points.pop_front();
+    }
     for p in path {
         points.push_front(p);
     }
@@ -260,7 +279,10 @@ pub(super) fn open_leg(
 
 // Dijkstra over the visibility graph. Edges are built on demand and a node
 // may connect to any other visible node, including corners on another box.
-fn shortest_path(nodes: &[[f32; 2]], obstacles: &[Footprint]) -> Option<Vec<[f32; 2]>> {
+fn shortest_path<'a>(
+    nodes: &[[f32; 2]],
+    obstacles: impl Iterator<Item = &'a Footprint> + Clone,
+) -> Option<Vec<[f32; 2]>> {
     let mut distance_to = vec![f32::INFINITY; nodes.len()];
     let mut parent = vec![None; nodes.len()];
     let mut settled = vec![false; nodes.len()];
@@ -275,7 +297,7 @@ fn shortest_path(nodes: &[[f32; 2]], obstacles: &[Footprint]) -> Option<Vec<[f32
         settled[next] = true;
         for (i, &to) in nodes.iter().enumerate().filter(|&(i, _)| !settled[i]) {
             let cost = distance_to[next] + distance(nodes[next], to);
-            if cost < distance_to[i] && !obstacles.iter().any(|o| o.intersects(nodes[next], to)) {
+            if cost < distance_to[i] && !obstacles.clone().any(|o| o.intersects(nodes[next], to)) {
                 distance_to[i] = cost;
                 parent[i] = Some(next);
             }
@@ -309,7 +331,7 @@ mod tests {
         let start = [0.0, 0.0];
         let goal = [9.0, 0.0];
         let mut route = VecDeque::from([goal]);
-        assert!(open_leg(start, &mut route, &[a, b], |_| Ok(true)).unwrap());
+        assert!(open_leg(start, &mut route, &[a, b], &[], |_| Ok(true)).unwrap());
         assert!(route.len() >= 3);
         assert_eq!(route.back(), Some(&goal));
         let mut from = start;
@@ -328,9 +350,9 @@ mod tests {
         };
         let goal = [10.0, 0.0];
         let mut route = VecDeque::from([goal]);
-        assert!(open_leg([1.0, 0.0], &mut route, &[building], |_| Ok(true)).unwrap());
+        assert!(open_leg([1.0, 0.0], &mut route, &[building], &[], |_| Ok(true)).unwrap());
         assert_eq!(route, [[-CORNER_GAP, 0.0], goal]);
-        assert!(open_leg([0.5, 0.0], &mut route, &[building], |_| Ok(true)).unwrap());
+        assert!(open_leg([0.5, 0.0], &mut route, &[building], &[], |_| Ok(true)).unwrap());
         assert_eq!(route.len(), 2);
     }
 
@@ -371,7 +393,7 @@ mod tests {
         let goal = [outline.max[0] + 8.0, y];
         assert!(outline.intersects(start, goal));
         let mut route = VecDeque::from([goal]);
-        assert!(open_leg(start, &mut route, &[outline], |p| {
+        assert!(open_leg(start, &mut route, &[outline], &[], |p| {
             mission
                 .terrain
                 .height_at(p)
