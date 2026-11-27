@@ -6,7 +6,7 @@ on:
 
 jobs:
   renovate:
-    container: ghcr.io/renovatebot/renovate:44
+    container: ghcr.io/renovatebot/renovate:45
     runs-on: ubuntu-latest
 
     steps:
